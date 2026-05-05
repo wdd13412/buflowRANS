@@ -43,12 +43,12 @@ module BuFlowModule
     !===========================================================================
     ! SIMPLE solver parameters
     !===========================================================================
-    real(kind=8), parameter :: SIMPLE_ALPHA_U = 0.3d0
-    real(kind=8), parameter :: SIMPLE_ALPHA_P = 0.05d0
+    real(kind=8), parameter :: SIMPLE_ALPHA_U = 0.2d0
+    real(kind=8), parameter :: SIMPLE_ALPHA_P = 0.1d0
     real(kind=8), parameter :: SIMPLE_ALPHA_K = 0.5d0
     real(kind=8), parameter :: SIMPLE_ALPHA_OMEGA = 0.5d0
     integer, parameter :: SIMPLE_MAX_ITER = 3000
-    integer, parameter :: SIMPLE_MAX_INNER_U = 5
+    integer, parameter :: SIMPLE_MAX_INNER_U = 10
     integer, parameter :: SIMPLE_MAX_INNER_P = 200
     real(kind=8), parameter :: SIMPLE_TOLERANCE = 1.0d-6
     integer, parameter :: SIMPLE_OUTPUT_INTERVAL = 50
@@ -4419,9 +4419,6 @@ function triangleCentroid(points)
 		
 		output_count = 0
 		
-		! 一次性诊断：检查入口/出口面积法向量
-		call simple_diagnose_boundary(mesh, ss, boundaryConditions, fluid, U_init)
-		
 		do iter = 1, SIMPLE_MAX_ITER
 			u_old = ss%u
 			v_old = ss%v
@@ -4448,10 +4445,10 @@ function triangleCentroid(points)
 			res_p = maxval(abs(ss%p - p_old)) / max(maxval(abs(ss%p)), 1.0d-10)
 			res_max = max(res_u, res_v, res_w, res_p)
 			
-			if (mod(iter, 1) == 0 .and. iter <= 30 .or. mod(iter, 10) == 0) then
-				write(*,'(A,I6,A,4ES12.4,A,2ES12.4)') ' SIMPLE iter=', iter, &
+			if (iter <= 5 .or. mod(iter, 50) == 0) then
+				write(*,'(A,I6,A,4ES11.3,A,2ES11.3)') ' SIMPLE iter=', iter, &
 					'  res=', res_u, res_v, res_w, res_p, &
-					'  p=', minval(ss%p), maxval(ss%p)
+					'  p=', minval(ss%p)+ss%p_ref, maxval(ss%p)+ss%p_ref
 			end if
 			
 			! 循环内VTK输出已禁用，加速调试
@@ -4465,14 +4462,6 @@ function triangleCentroid(points)
 				exit
 			end if
 			
-			! 诊断：找出速度最大的单元
-			if (iter <= 15 .or. any(ss%u /= ss%u)) then
-				c = maxloc(abs(ss%u), 1)
-				write(*,'(A,I6,A,I8,A,3ES12.4,A,ES12.4,A,ES12.4)') &
-					'  DBG iter=', iter, ' maxU_cell=', c, &
-					' u,v,w=', ss%u(c), ss%v(c), ss%w(c), &
-					' aP=', ss%aP_u(c), ' Vol=', mesh%cVols(c)
-			end if
 			if (any(ss%u /= ss%u) .or. any(ss%p /= ss%p)) then
 				print *, 'ERROR: NaN at iter', iter
 				exit
@@ -4546,9 +4535,9 @@ function triangleCentroid(points)
 			if (d_m < 1.0d-30) cycle
 			
 			mu_e = 0.5d0 * (ss%mu_l(oc)+ss%mu_t(oc)+ss%mu_l(nc)+ss%mu_t(nc))
-			fv(1) = 0.5d0*(ss%u(oc)+ss%u(nc))
-			fv(2) = 0.5d0*(ss%v(oc)+ss%v(nc))
-			fv(3) = 0.5d0*(ss%w(oc)+ss%w(nc))
+			fv(1) = max(-50.0d0, min(50.0d0, 0.5d0*(ss%u(oc)+ss%u(nc))))
+			fv(2) = max(-50.0d0, min(50.0d0, 0.5d0*(ss%v(oc)+ss%v(nc))))
+			fv(3) = max(-50.0d0, min(50.0d0, 0.5d0*(ss%w(oc)+ss%w(nc))))
 			fc = rho * dot_product(fv, fn)
 			a_d = mu_e * fn_m / d_m
 			
@@ -4603,8 +4592,8 @@ function triangleCentroid(points)
 		end do
 		
 		do c = 1, ss%nCells
-			! 无伪瞬态，靠速度变化限制器保持稳定
-			aP(c) = max(aP(c), 1.0d-10)
+			! 确保对角主导：aP 至少为参考对流量级
+			aP(c) = max(aP(c), rho * mag(U_in) * mesh%cVols(c)**(2.0d0/3.0d0))
 		end do
 		ss%aP_u = aP / SIMPLE_ALPHA_U
 		
@@ -4620,21 +4609,21 @@ function triangleCentroid(points)
 				do idx = 1, aN_n(c)
 					nb_s = nb_s + aN_c(c,idx)*ss%u(aN_i(c,idx))
 				end do
-				ss%u(c) = (bU(c) + nb_s) / ss%aP_u(c)
+				ss%u(c) = max(-50.0d0, min(50.0d0, (bU(c) + nb_s) / ss%aP_u(c)))
 			end do
 			do c = 1, ss%nCells
 				nb_s = 0.0d0
 				do idx = 1, aN_n(c)
 					nb_s = nb_s + aN_c(c,idx)*ss%v(aN_i(c,idx))
 				end do
-				ss%v(c) = (bV(c) + nb_s) / ss%aP_u(c)
+				ss%v(c) = max(-50.0d0, min(50.0d0, (bV(c) + nb_s) / ss%aP_u(c)))
 			end do
 			do c = 1, ss%nCells
 				nb_s = 0.0d0
 				do idx = 1, aN_n(c)
 					nb_s = nb_s + aN_c(c,idx)*ss%w(aN_i(c,idx))
 				end do
-				ss%w(c) = (bW(c) + nb_s) / ss%aP_u(c)
+				ss%w(c) = max(-50.0d0, min(50.0d0, (bW(c) + nb_s) / ss%aP_u(c)))
 			end do
 		end do
 		
@@ -4682,9 +4671,9 @@ function triangleCentroid(points)
 			if (d_m < 1.0d-30) cycle
 			
 			D_f = 0.5d0*(mesh%cVols(oc)/ss%aP_u(oc) + mesh%cVols(nc)/ss%aP_u(nc))
-			fv(1)=0.5d0*(ss%u(oc)+ss%u(nc))
-			fv(2)=0.5d0*(ss%v(oc)+ss%v(nc))
-			fv(3)=0.5d0*(ss%w(oc)+ss%w(nc))
+			fv(1)=max(-50.0d0,min(50.0d0,0.5d0*(ss%u(oc)+ss%u(nc))))
+			fv(2)=max(-50.0d0,min(50.0d0,0.5d0*(ss%v(oc)+ss%v(nc))))
+			fv(3)=max(-50.0d0,min(50.0d0,0.5d0*(ss%w(oc)+ss%w(nc))))
 			
 			flux_s = rho*dot_product(fv, fn) &
 				- rho*D_f*((ss%p(nc)-ss%p(oc))/d_m*fn_m &
@@ -4739,12 +4728,6 @@ function triangleCentroid(points)
 			if (aP_pp(c) < 1.0d-30) aP_pp(c) = 1.0d0
 		end do
 		
-		! 诊断（仅前3次）
-		if (abs(ss%p(1)) < 1.0d3) then
-			write(*,'(A,ES12.4,A,ES12.4)') &
-				'  PP_DBG: sum(src)=', sum(src), ' max|src|=', maxval(abs(src))
-		end if
-		
 		do gs = 1, SIMPLE_MAX_INNER_P
 			do c = 1, ss%nCells
 				nb_s = 0.0d0
@@ -4755,13 +4738,13 @@ function triangleCentroid(points)
 			end do
 		end do
 		
-		! 限制压力修正幅度（防止压力漂移）
+		! 限制p'幅度（用动压量级限制：0.5*rho*U^2 ~ 70Pa）
 		do c = 1, ss%nCells
-			ss%p_prime(c) = max(-500.0d0, min(500.0d0, ss%p_prime(c)))
+			ss%p_prime(c) = max(-100.0d0, min(100.0d0, ss%p_prime(c)))
 		end do
 		ss%p = ss%p + SIMPLE_ALPHA_P * ss%p_prime
 		
-		! 压力参考点修正：减去平均值防止漂移
+		! 压力参考点：减去均值防漂移
 		ss%p = ss%p - sum(ss%p) / dble(ss%nCells)
 		
 		allocate(pm(ss%nCells, 1))
@@ -4773,13 +4756,12 @@ function triangleCentroid(points)
 		deallocate(tg, pm)
 		
 		do c = 1, ss%nCells
+			! D_cell 限制：最大修正速度不超过 U_ref
 			D_c = mesh%cVols(c) / ss%aP_u(c)
+			D_c = min(D_c, 1.0d-3)
 			ss%u(c) = ss%u(c) - D_c*gPp(c,1)
 			ss%v(c) = ss%v(c) - D_c*gPp(c,2)
 			ss%w(c) = ss%w(c) - D_c*gPp(c,3)
-			ss%u(c) = max(-50.0d0, min(50.0d0, ss%u(c)))
-			ss%v(c) = max(-50.0d0, min(50.0d0, ss%v(c)))
-			ss%w(c) = max(-50.0d0, min(50.0d0, ss%w(c)))
 		end do
 		
 		deallocate(gP, gPp)
