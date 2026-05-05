@@ -43,8 +43,8 @@ module BuFlowModule
     !===========================================================================
     ! SIMPLE solver parameters
     !===========================================================================
-    real(kind=8), parameter :: SIMPLE_ALPHA_U = 0.2d0
-    real(kind=8), parameter :: SIMPLE_ALPHA_P = 0.1d0
+    real(kind=8), parameter :: SIMPLE_ALPHA_U = 0.3d0
+    real(kind=8), parameter :: SIMPLE_ALPHA_P = 0.05d0
     real(kind=8), parameter :: SIMPLE_ALPHA_K = 0.5d0
     real(kind=8), parameter :: SIMPLE_ALPHA_OMEGA = 0.5d0
     integer, parameter :: SIMPLE_MAX_ITER = 3000
@@ -152,6 +152,7 @@ module BuFlowModule
 		real(kind=8), allocatable :: p_prime(:)
 		real(kind=8), allocatable :: aP_u(:)
 		real(kind=8), allocatable :: rho_field(:)
+		real(kind=8), allocatable :: phi_f(:)  ! 面质量通量 (kg/s)
 		real(kind=8) :: rho_ref
 		real(kind=8) :: p_ref
 	end type SIMPLEState
@@ -4356,7 +4357,9 @@ function triangleCentroid(points)
 
 
 !===============================================================================
-! SECTION 12: SIMPLE PRESSURE-BASED SOLVER FOR LOW MACH NUMBER
+
+!===============================================================================
+! SECTION 12: SIMPLE 压力基求解器（基于面通量的正确实现）
 !===============================================================================
 
 	subroutine solve_SIMPLE(mesh, meshPath, boundaryConditions, fluid, &
@@ -4370,51 +4373,58 @@ function triangleCentroid(points)
 		
 		type(SIMPLEState) :: ss
 		integer(kind=8) :: meshInfo(4)
-		integer :: iter, c
-		real(kind=8) :: res_u, res_v, res_w, res_p, res_max
+		integer :: iter, c, f, nInt
+		real(kind=8) :: res_u, res_v, res_p, res_max
 		real(kind=8), allocatable :: u_old(:), v_old(:), w_old(:), p_old(:)
 		integer :: output_count
+		real(kind=8) :: fn(3), rho
 		
 		meshInfo = unstructuredMeshInfo(mesh)
 		ss%nCells = int(meshInfo(1))
 		ss%nFaces = int(meshInfo(2))
 		ss%nBoundaries = int(meshInfo(3))
 		ss%nBdryFaces = int(meshInfo(4))
+		nInt = ss%nFaces - ss%nBdryFaces
 		
 		call computeWallDistances(mesh)
 		
 		ss%rho_ref = P_init / (fluid%R * T_init)
 		ss%p_ref = P_init
+		rho = ss%rho_ref
 		
 		allocate(ss%p(ss%nCells), ss%u(ss%nCells), ss%v(ss%nCells), ss%w(ss%nCells))
 		allocate(ss%k(ss%nCells), ss%omega(ss%nCells))
 		allocate(ss%mu_t(ss%nCells), ss%mu_l(ss%nCells))
 		allocate(ss%p_prime(ss%nCells), ss%aP_u(ss%nCells))
 		allocate(ss%rho_field(ss%nCells))
+		allocate(ss%phi_f(ss%nFaces))
 		allocate(u_old(ss%nCells), v_old(ss%nCells), w_old(ss%nCells), p_old(ss%nCells))
 		
-		ss%p = 0.0d0  ! 使用表压（gauge pressure），p_ref = P_init 作为参考压力
+		! 初始化：表压=0，均匀速度场
+		ss%p = 0.0d0
 		ss%u = U_init(1)
 		ss%v = U_init(2)
 		ss%w = U_init(3)
 		ss%k = k_init
 		ss%omega = omega_init
-		ss%rho_field = ss%rho_ref
+		ss%rho_field = rho
 		ss%mu_l = fluid%mu_laminar
-		do c = 1, ss%nCells
-			ss%mu_t(c) = ss%rho_ref * k_init / max(omega_init, SMALL_NUM)
-			ss%mu_t(c) = min(ss%mu_t(c), 1.0d4 * ss%mu_l(c))
-		end do
+		ss%mu_t = rho * k_init / max(omega_init, SMALL_NUM)
 		ss%aP_u = 1.0d0
 		ss%p_prime = 0.0d0
 		
+		! 初始化面通量：用均匀速度场计算
+		do f = 1, ss%nFaces
+			fn = mesh%fAVecs(f,:)
+			ss%phi_f(f) = rho * dot_product(U_init, fn)
+		end do
+		
 		print *, ''
 		print *, '=========================================='
-		print *, ' SIMPLE Pressure-Based Solver'
+		print *, ' SIMPLE 压力基求解器（面通量版）'
 		print *, '=========================================='
-		print *, '  Cells:', ss%nCells, ' Faces:', ss%nFaces
-		print *, '  rho_ref =', ss%rho_ref
-		print *, '  U_ref   =', mag(U_init)
+		write(*,'(A,I8,A,I8)') '  单元:', ss%nCells, '  面:', ss%nFaces
+		write(*,'(A,F8.4,A,F6.2)') '  rho=', rho, '  U_ref=', mag(U_init)
 		print *, ''
 		
 		output_count = 0
@@ -4425,40 +4435,41 @@ function triangleCentroid(points)
 			w_old = ss%w
 			p_old = ss%p
 			
+			! 更新湍流粘性
 			do c = 1, ss%nCells
-				ss%mu_t(c) = ss%rho_ref * max(ss%k(c), SMALL_NUM) / max(ss%omega(c), SMALL_NUM)
+				ss%mu_t(c) = rho * max(ss%k(c),SMALL_NUM) / max(ss%omega(c),SMALL_NUM)
 				ss%mu_t(c) = min(ss%mu_t(c), 1.0d4 * ss%mu_l(c))
 			end do
 			
-			call simple_momentum_all(mesh, ss, boundaryConditions, fluid, U_init)
-			call simple_pressure_correct(mesh, ss, boundaryConditions, fluid, U_init)
+			! 步骤1：求解动量方程（使用面通量phi_f做upwind）
+			call simple2_momentum(mesh, ss, boundaryConditions, fluid, U_init)
 			
-			! 无额外速度限制——靠under-relaxation控制
+			! 步骤2：压力修正（Rhie-Chow + 更新phi_f和速度）
+			call simple2_pressure(mesh, ss, boundaryConditions, fluid, U_init)
 			
-			if (mod(iter, 50) == 0 .and. iter > 100) then
+			! 步骤3：全局质量修正
+			call simple2_mass_fix(mesh, ss, boundaryConditions, rho, U_init)
+			
+			! 步骤4：湍流（每100步一次，延迟启动）
+			if (mod(iter, 100) == 0 .and. iter > 500) then
 				call simple_turbulence(mesh, ss, fluid)
 			end if
 			
-			res_u = maxval(abs(ss%u - u_old)) / max(maxval(abs(ss%u)), 1.0d-10)
-			res_v = maxval(abs(ss%v - v_old)) / max(maxval(abs(ss%v)), 1.0d-10)
-			res_w = maxval(abs(ss%w - w_old)) / max(maxval(abs(ss%w)), 1.0d-10)
-			res_p = maxval(abs(ss%p - p_old)) / max(maxval(abs(ss%p)), 1.0d-10)
-			res_max = max(res_u, res_v, res_w, res_p)
+			! 残差计算
+			res_u = sqrt(sum((ss%u-u_old)**2)/ss%nCells) / max(mag(U_init), 1.0d-10)
+			res_v = sqrt(sum((ss%v-v_old)**2)/ss%nCells) / max(mag(U_init), 1.0d-10)
+			res_p = sqrt(sum((ss%p-p_old)**2)/ss%nCells) / max(0.5d0*rho*mag(U_init)**2, 1.0d-10)
+			res_max = max(res_u, res_v, res_p)
 			
 			if (iter <= 5 .or. mod(iter, 50) == 0) then
-				write(*,'(A,I6,A,4ES11.3,A,2ES11.3)') ' SIMPLE iter=', iter, &
-					'  res=', res_u, res_v, res_w, res_p, &
-					'  p=', minval(ss%p)+ss%p_ref, maxval(ss%p)+ss%p_ref
+				write(*,'(A,I6,A,3ES11.3,A,F8.1,A,F8.1)') &
+					' SIMPLE ', iter, '  res(u,v,p)=', res_u, res_v, res_p, &
+					'  Umax=', maxval(abs(ss%u)), &
+					'  dp=', maxval(ss%p)-minval(ss%p)
 			end if
 			
-			! 循环内VTK输出已禁用，加速调试
-			! if (mod(iter, SIMPLE_OUTPUT_INTERVAL) == 0) then
-			! 	output_count = output_count + 1
-			! 	call simple_writeVTK(mesh, ss, meshPath, output_count, fluid)
-			! end if
-			
-			if (res_max < SIMPLE_TOLERANCE .and. iter > 20) then
-				print *, '=== SIMPLE converged at iteration', iter, ' ==='
+			if (res_max < SIMPLE_TOLERANCE .and. iter > 50) then
+				print *, '=== SIMPLE 收敛于迭代步', iter, ' ==='
 				exit
 			end if
 			
@@ -4469,22 +4480,25 @@ function triangleCentroid(points)
 		end do
 		
 		print *, ''
-		print *, '=== SIMPLE Solution Summary ==='
-		print *, '  P gauge :', minval(ss%p), maxval(ss%p)
-		print *, '  P abs   :', minval(ss%p)+ss%p_ref, maxval(ss%p)+ss%p_ref
-		print *, '  U range :', minval(ss%u), maxval(ss%u)
-		print *, '  V range :', minval(ss%v), maxval(ss%v)
-		print *, '  |V| max :', maxval(sqrt(ss%u**2 + ss%v**2 + ss%w**2))
+		print *, '=== SIMPLE 结果 ==='
+		write(*,'(A,F10.1,A,F10.1)') '  P gauge : ', minval(ss%p), ' ~ ', maxval(ss%p)
+		write(*,'(A,F10.1,A,F10.1)') '  P abs   : ', minval(ss%p)+ss%p_ref, ' ~ ', maxval(ss%p)+ss%p_ref
+		write(*,'(A,F10.3,A,F10.3)') '  Ux      : ', minval(ss%u), ' ~ ', maxval(ss%u)
+		write(*,'(A,F10.3,A,F10.3)') '  Uy      : ', minval(ss%v), ' ~ ', maxval(ss%v)
+		write(*,'(A,F10.3)') '  |V| max : ', maxval(sqrt(ss%u**2+ss%v**2+ss%w**2))
 		
-		output_count = output_count + 1
+		output_count = 1
 		call simple_writeVTK(mesh, ss, meshPath, output_count, fluid)
 		
 		deallocate(ss%p, ss%u, ss%v, ss%w, ss%k, ss%omega)
 		deallocate(ss%mu_t, ss%mu_l, ss%p_prime, ss%aP_u, ss%rho_field)
-		deallocate(u_old, v_old, w_old, p_old)
+		deallocate(ss%phi_f, u_old, v_old, w_old, p_old)
 	end subroutine solve_SIMPLE
 
-	subroutine simple_momentum_all(mesh, ss, bcs, fluid, U_in)
+!-----------------------------------------------------------------------
+! 步骤1：动量方程——使用存储的面通量做upwind对流
+!-----------------------------------------------------------------------
+	subroutine simple2_momentum(mesh, ss, bcs, fluid, U_in)
 		implicit none
 		type(Meshh), intent(in) :: mesh
 		type(SIMPLEState), intent(inout) :: ss
@@ -4494,8 +4508,8 @@ function triangleCentroid(points)
 		
 		integer :: c, f, b, fi, face_idx, oc, nc, gs, idx
 		integer :: nInt
-		real(kind=8) :: rho, mu_e, d_m, fc, a_d
-		real(kind=8) :: fn(3), fn_m, fv(3), nb_s
+		real(kind=8) :: rho, mu_e, d_m, a_d, phi_f
+		real(kind=8) :: fn(3), fn_m, nb_s
 		integer, parameter :: MNB = 30
 		real(kind=8) :: aP(ss%nCells), bU(ss%nCells), bV(ss%nCells), bW(ss%nCells)
 		real(kind=8) :: aN_c(ss%nCells, MNB)
@@ -4505,6 +4519,7 @@ function triangleCentroid(points)
 		nInt = ss%nFaces - ss%nBdryFaces
 		rho = ss%rho_ref
 		
+		! 计算压力梯度
 		allocate(pm(ss%nCells, 1))
 		pm(:,1) = ss%p
 		allocate(tg(ss%nCells, 1, 3))
@@ -4513,78 +4528,76 @@ function triangleCentroid(points)
 		gP(:,1) = tg(:,1,1); gP(:,2) = tg(:,1,2); gP(:,3) = tg(:,1,3)
 		deallocate(tg, pm)
 		
-		aP = 0.0d0
-		bU = 0.0d0; bV = 0.0d0; bW = 0.0d0
+		aP = 0.0d0; bU = 0.0d0; bV = 0.0d0; bW = 0.0d0
 		aN_c = 0.0d0; aN_i = 0; aN_n = 0
 		
+		! 压力梯度源项
 		do c = 1, ss%nCells
 			bU(c) = -gP(c,1) * mesh%cVols(c)
 			bV(c) = -gP(c,2) * mesh%cVols(c)
 			bW(c) = -gP(c,3) * mesh%cVols(c)
 		end do
 		
+		! 内部面：使用存储的面通量phi_f做upwind对流
 		do f = 1, nInt
-			oc = mesh%faces(f, 1)
-			nc = mesh%faces(f, 2)
-			if (oc < 1 .or. oc > ss%nCells .or. nc < 1 .or. nc > ss%nCells) cycle
+			oc = mesh%faces(f, 1); nc = mesh%faces(f, 2)
+			if (oc<1.or.oc>ss%nCells.or.nc<1.or.nc>ss%nCells) cycle
 			
-			fn = mesh%fAVecs(f,:)
-			fn_m = mag(fn)
+			fn = mesh%fAVecs(f,:); fn_m = mag(fn)
 			if (fn_m < 1.0d-30) cycle
 			d_m = mag(mesh%cCenters(nc,:) - mesh%cCenters(oc,:))
 			if (d_m < 1.0d-30) cycle
 			
-			mu_e = 0.5d0 * (ss%mu_l(oc)+ss%mu_t(oc)+ss%mu_l(nc)+ss%mu_t(nc))
-			fv(1) = max(-50.0d0, min(50.0d0, 0.5d0*(ss%u(oc)+ss%u(nc))))
-			fv(2) = max(-50.0d0, min(50.0d0, 0.5d0*(ss%v(oc)+ss%v(nc))))
-			fv(3) = max(-50.0d0, min(50.0d0, 0.5d0*(ss%w(oc)+ss%w(nc))))
-			fc = rho * dot_product(fv, fn)
-			a_d = mu_e * fn_m / d_m
+			mu_e = 0.5d0*(ss%mu_l(oc)+ss%mu_t(oc)+ss%mu_l(nc)+ss%mu_t(nc))
+			phi_f = ss%phi_f(f)  ! 存储的面质量通量
+			a_d = mu_e * fn_m / d_m  ! 扩散系数
 			
+			! upwind对流 + 扩散 → 邻居系数
 			if (aN_n(oc) < MNB) then
 				aN_n(oc) = aN_n(oc) + 1
 				aN_i(oc, aN_n(oc)) = nc
-				aN_c(oc, aN_n(oc)) = a_d + max(-fc, 0.0d0)
+				aN_c(oc, aN_n(oc)) = a_d + max(-phi_f, 0.0d0)
 			end if
-			aP(oc) = aP(oc) + a_d + max(fc, 0.0d0)
+			aP(oc) = aP(oc) + a_d + max(phi_f, 0.0d0)
 			
 			if (aN_n(nc) < MNB) then
 				aN_n(nc) = aN_n(nc) + 1
 				aN_i(nc, aN_n(nc)) = oc
-				aN_c(nc, aN_n(nc)) = a_d + max(fc, 0.0d0)
+				aN_c(nc, aN_n(nc)) = a_d + max(phi_f, 0.0d0)
 			end if
-			aP(nc) = aP(nc) + a_d + max(-fc, 0.0d0)
+			aP(nc) = aP(nc) + a_d + max(-phi_f, 0.0d0)
 		end do
 		
+		! 边界面
 		do b = 1, min(ss%nBoundaries, size(bcs))
 			do fi = 1, size(mesh%boundaryFaces, 2)
 				face_idx = mesh%boundaryFaces(b, fi)
 				if (face_idx == 0) exit
-				if (face_idx < 1 .or. face_idx > ss%nFaces) cycle
+				if (face_idx<1.or.face_idx>ss%nFaces) cycle
 				oc = mesh%faces(face_idx, 1)
-				if (oc < 1 .or. oc > ss%nCells) cycle
-				fn = mesh%fAVecs(face_idx,:)
-				fn_m = mag(fn)
+				if (oc<1.or.oc>ss%nCells) cycle
+				fn = mesh%fAVecs(face_idx,:); fn_m = mag(fn)
 				if (fn_m < 1.0d-30) cycle
 				d_m = max(mag(mesh%fCenters(face_idx,:)-mesh%cCenters(oc,:)), 1.0d-10)
 				mu_e = ss%mu_l(oc) + ss%mu_t(oc)
 				
 				select case(bcs(b)%type)
 				case(wallBoundary)
+					! 壁面：phi_b=0, u_b=0 → 扩散贡献到aP
 					a_d = mu_e * fn_m / d_m
 					aP(oc) = aP(oc) + a_d
 				case(InletBoundary)
-					a_d = mu_e * fn_m / d_m
-					fc = rho * dot_product(U_in, fn)
-					a_d = a_d + max(fc, 0.0d0)
+					! 入口：固定速度 → 当作已知值处理
+					phi_f = ss%phi_f(face_idx)
+					a_d = mu_e * fn_m / d_m + max(phi_f, 0.0d0)
 					aP(oc) = aP(oc) + a_d
 					bU(oc) = bU(oc) + a_d * U_in(1)
 					bV(oc) = bV(oc) + a_d * U_in(2)
 					bW(oc) = bW(oc) + a_d * U_in(3)
 				case(OutletBoundary)
-					fv = (/ss%u(oc), ss%v(oc), ss%w(oc)/)
-					fc = rho * dot_product(fv, fn)
-					if (fc > 0.0d0) aP(oc) = aP(oc) + fc
+					! 出口：零梯度 → 对流贡献到aP
+					phi_f = ss%phi_f(face_idx)
+					if (phi_f > 0.0d0) aP(oc) = aP(oc) + phi_f
 				case(emptyBoundary)
 					continue
 				end select
@@ -4592,45 +4605,50 @@ function triangleCentroid(points)
 		end do
 		
 		do c = 1, ss%nCells
-			! 确保对角主导：aP 至少为参考对流量级
+			! aP下限：保证足够的对角主导
 			aP(c) = max(aP(c), rho * mag(U_in) * mesh%cVols(c)**(2.0d0/3.0d0))
 		end do
-		ss%aP_u = aP / SIMPLE_ALPHA_U
 		
+		! under-relaxation: aP_u = aP/alpha, b += (1-alpha)*aP_u*u_old
+		ss%aP_u = aP / SIMPLE_ALPHA_U
 		do c = 1, ss%nCells
-			bU(c) = bU(c) + (1.0d0-SIMPLE_ALPHA_U)*ss%aP_u(c)*ss%u(c)
-			bV(c) = bV(c) + (1.0d0-SIMPLE_ALPHA_U)*ss%aP_u(c)*ss%v(c)
-			bW(c) = bW(c) + (1.0d0-SIMPLE_ALPHA_U)*ss%aP_u(c)*ss%w(c)
+			bU(c) = bU(c) + (1.0d0-SIMPLE_ALPHA_U) * ss%aP_u(c) * ss%u(c)
+			bV(c) = bV(c) + (1.0d0-SIMPLE_ALPHA_U) * ss%aP_u(c) * ss%v(c)
+			bW(c) = bW(c) + (1.0d0-SIMPLE_ALPHA_U) * ss%aP_u(c) * ss%w(c)
 		end do
 		
+		! Gauss-Seidel 求解
 		do gs = 1, SIMPLE_MAX_INNER_U
 			do c = 1, ss%nCells
 				nb_s = 0.0d0
 				do idx = 1, aN_n(c)
-					nb_s = nb_s + aN_c(c,idx)*ss%u(aN_i(c,idx))
+					nb_s = nb_s + aN_c(c,idx) * ss%u(aN_i(c,idx))
 				end do
 				ss%u(c) = max(-50.0d0, min(50.0d0, (bU(c) + nb_s) / ss%aP_u(c)))
 			end do
 			do c = 1, ss%nCells
 				nb_s = 0.0d0
 				do idx = 1, aN_n(c)
-					nb_s = nb_s + aN_c(c,idx)*ss%v(aN_i(c,idx))
+					nb_s = nb_s + aN_c(c,idx) * ss%v(aN_i(c,idx))
 				end do
 				ss%v(c) = max(-50.0d0, min(50.0d0, (bV(c) + nb_s) / ss%aP_u(c)))
 			end do
 			do c = 1, ss%nCells
 				nb_s = 0.0d0
 				do idx = 1, aN_n(c)
-					nb_s = nb_s + aN_c(c,idx)*ss%w(aN_i(c,idx))
+					nb_s = nb_s + aN_c(c,idx) * ss%w(aN_i(c,idx))
 				end do
 				ss%w(c) = max(-50.0d0, min(50.0d0, (bW(c) + nb_s) / ss%aP_u(c)))
 			end do
 		end do
 		
 		deallocate(gP)
-	end subroutine simple_momentum_all
+	end subroutine simple2_momentum
 
-	subroutine simple_pressure_correct(mesh, ss, bcs, fluid, U_in)
+!-----------------------------------------------------------------------
+! 步骤2：压力修正——基于面通量的Rhie-Chow + 同时更新phi_f和速度
+!-----------------------------------------------------------------------
+	subroutine simple2_pressure(mesh, ss, bcs, fluid, U_in)
 		implicit none
 		type(Meshh), intent(in) :: mesh
 		type(SIMPLEState), intent(inout) :: ss
@@ -4640,6 +4658,7 @@ function triangleCentroid(points)
 		
 		integer :: c, f, b, fi, face_idx, oc, nc, gs, idx, nInt
 		real(kind=8) :: rho, fn(3), fn_m, d_m, D_f, flux_s, fv(3), D_c
+		real(kind=8) :: dyn_p
 		integer, parameter :: MNB = 30
 		real(kind=8) :: aP_pp(ss%nCells), src(ss%nCells)
 		real(kind=8) :: aN_pp(ss%nCells, MNB)
@@ -4649,9 +4668,10 @@ function triangleCentroid(points)
 		
 		nInt = ss%nFaces - ss%nBdryFaces
 		rho = ss%rho_ref
+		dyn_p = 0.5d0 * rho * mag(U_in)**2  ! 动压参考
 		
-		allocate(pm(ss%nCells, 1))
-		pm(:,1) = ss%p
+		! 压力梯度
+		allocate(pm(ss%nCells, 1)); pm(:,1) = ss%p
 		allocate(tg(ss%nCells, 1, 3))
 		tg = greenGaussGrad_RANS(mesh, pm, .false.)
 		allocate(gP(ss%nCells, 3))
@@ -4662,26 +4682,34 @@ function triangleCentroid(points)
 		aN_pp = 0.0d0; nb_i = 0; nb_n = 0
 		ss%p_prime = 0.0d0
 		
+		! 内部面：计算面通量（预测值）和Rhie-Chow修正的压力系数
 		do f = 1, nInt
-			oc = mesh%faces(f, 1); nc = mesh%faces(f, 2)
+			oc = mesh%faces(f,1); nc = mesh%faces(f,2)
 			if (oc<1.or.oc>ss%nCells.or.nc<1.or.nc>ss%nCells) cycle
 			fn = mesh%fAVecs(f,:); fn_m = mag(fn)
 			if (fn_m < 1.0d-30) cycle
 			d_m = mag(mesh%cCenters(nc,:)-mesh%cCenters(oc,:))
 			if (d_m < 1.0d-30) cycle
 			
+			! Rhie-Chow 面速度：插值速度 - D_f*(face_grad_p - interp_grad_p)
 			D_f = 0.5d0*(mesh%cVols(oc)/ss%aP_u(oc) + mesh%cVols(nc)/ss%aP_u(nc))
-			fv(1)=max(-50.0d0,min(50.0d0,0.5d0*(ss%u(oc)+ss%u(nc))))
-			fv(2)=max(-50.0d0,min(50.0d0,0.5d0*(ss%v(oc)+ss%v(nc))))
-			fv(3)=max(-50.0d0,min(50.0d0,0.5d0*(ss%w(oc)+ss%w(nc))))
+			fv(1) = 0.5d0*(ss%u(oc)+ss%u(nc))
+			fv(2) = 0.5d0*(ss%v(oc)+ss%v(nc))
+			fv(3) = 0.5d0*(ss%w(oc)+ss%w(nc))
 			
-			flux_s = rho*dot_product(fv, fn) &
-				- rho*D_f*((ss%p(nc)-ss%p(oc))/d_m*fn_m &
+			! Rhie-Chow 面通量（预测值）
+			flux_s = rho * dot_product(fv, fn) &
+				- rho * D_f * ((ss%p(nc)-ss%p(oc))/d_m * fn_m &
 				  - dot_product(0.5d0*(gP(oc,:)+gP(nc,:)), fn))
 			
+			! 存储预测面通量
+			ss%phi_f(f) = flux_s
+			
+			! 连续性源项
 			src(oc) = src(oc) - flux_s
 			src(nc) = src(nc) + flux_s
 			
+			! 压力修正方程系数
 			D_f = rho * D_f * fn_m / d_m
 			aP_pp(oc) = aP_pp(oc) + D_f
 			aP_pp(nc) = aP_pp(nc) + D_f
@@ -4694,6 +4722,7 @@ function triangleCentroid(points)
 			end if
 		end do
 		
+		! 边界面
 		do b = 1, min(ss%nBoundaries, size(bcs))
 			do fi = 1, size(mesh%boundaryFaces, 2)
 				face_idx = mesh%boundaryFaces(b, fi)
@@ -4706,16 +4735,16 @@ function triangleCentroid(points)
 				
 				select case(bcs(b)%type)
 				case(wallBoundary, emptyBoundary)
-					continue
+					continue  ! 壁面/空面无质量通量
 				case(InletBoundary)
-					flux_s = rho * dot_product(U_in, fn)
-					src(oc) = src(oc) - flux_s
+					! 入口通量固定
+					src(oc) = src(oc) - ss%phi_f(face_idx)
 				case(OutletBoundary)
-					! 出口：固定压力（p'=0），添加面通量到源项
+					! 出口通量用当前速度
 					fv = (/ss%u(oc), ss%v(oc), ss%w(oc)/)
 					flux_s = rho * dot_product(fv, fn)
 					src(oc) = src(oc) - flux_s
-					! 出口面 p'=0 → 贡献到对角系数（类似固定值BC）
+					! 出口 p'=0 → 贡献到对角
 					d_m = max(mag(mesh%fCenters(face_idx,:)-mesh%cCenters(oc,:)), 1.0d-10)
 					D_f = mesh%cVols(oc) / ss%aP_u(oc)
 					D_f = rho * D_f * fn_m / d_m
@@ -4728,6 +4757,7 @@ function triangleCentroid(points)
 			if (aP_pp(c) < 1.0d-30) aP_pp(c) = 1.0d0
 		end do
 		
+		! Gauss-Seidel 求解 p'
 		do gs = 1, SIMPLE_MAX_INNER_P
 			do c = 1, ss%nCells
 				nb_s = 0.0d0
@@ -4738,99 +4768,127 @@ function triangleCentroid(points)
 			end do
 		end do
 		
-		! 限制p'幅度（用动压量级限制：0.5*rho*U^2 ~ 70Pa）
+		! 限制 p' 幅度（用动压量级）
 		do c = 1, ss%nCells
-			ss%p_prime(c) = max(-100.0d0, min(100.0d0, ss%p_prime(c)))
+			ss%p_prime(c) = max(-200.0d0, min(200.0d0, ss%p_prime(c)))
 		end do
+		
+		! 更新压力
 		ss%p = ss%p + SIMPLE_ALPHA_P * ss%p_prime
+		ss%p = ss%p - sum(ss%p) / dble(ss%nCells)  ! 参考点修正
 		
-		! 压力参考点：减去均值防漂移
-		ss%p = ss%p - sum(ss%p) / dble(ss%nCells)
-		
-		allocate(pm(ss%nCells, 1))
-		pm(:,1) = ss%p_prime
+		! 计算 p' 梯度用于速度修正
+		allocate(pm(ss%nCells, 1)); pm(:,1) = ss%p_prime
 		allocate(tg(ss%nCells, 1, 3))
 		tg = greenGaussGrad_RANS(mesh, pm, .false.)
 		allocate(gPp(ss%nCells, 3))
 		gPp(:,1) = tg(:,1,1); gPp(:,2) = tg(:,1,2); gPp(:,3) = tg(:,1,3)
 		deallocate(tg, pm)
 		
+		! 速度修正 + 面通量更新
 		do c = 1, ss%nCells
-			! D_cell 限制：最大修正速度不超过 U_ref
 			D_c = mesh%cVols(c) / ss%aP_u(c)
-			D_c = min(D_c, 1.0d-3)
-			ss%u(c) = ss%u(c) - D_c*gPp(c,1)
-			ss%v(c) = ss%v(c) - D_c*gPp(c,2)
-			ss%w(c) = ss%w(c) - D_c*gPp(c,3)
+			ss%u(c) = ss%u(c) - D_c * gPp(c,1)
+			ss%v(c) = ss%v(c) - D_c * gPp(c,2)
+			ss%w(c) = ss%w(c) - D_c * gPp(c,3)
 		end do
 		
-		deallocate(gP, gPp)
+		! 更新内部面通量：phi_f = flux_star - D_f * (p'_N - p'_O)
+		! flux_star 已在上面 src 计算中计算，这里直接修正
+		do f = 1, nInt
+			oc = mesh%faces(f,1); nc = mesh%faces(f,2)
+			if (oc<1.or.oc>ss%nCells.or.nc<1.or.nc>ss%nCells) cycle
+			fn = mesh%fAVecs(f,:); fn_m = mag(fn)
+			if (fn_m < 1.0d-30) cycle
+			d_m = mag(mesh%cCenters(nc,:)-mesh%cCenters(oc,:))
+			if (d_m < 1.0d-30) cycle
+			
+			D_f = 0.5d0*(mesh%cVols(oc)/ss%aP_u(oc) + mesh%cVols(nc)/ss%aP_u(nc))
+			D_f = rho * D_f * fn_m / d_m
+			
+			! 直接修正面通量（而非重新计算）
+			ss%phi_f(f) = ss%phi_f(f) - D_f * (ss%p_prime(nc) - ss%p_prime(oc))
+		end do
 		
-		! 全局质量通量修正：调整出口速度确保质量守恒
-		call simple_correct_mass_flux(mesh, ss, bcs, fluid, U_in)
-	end subroutine simple_pressure_correct
-
-	! 修正出口面速度使全局质量通量平衡
-	subroutine simple_correct_mass_flux(mesh, ss, bcs, fluid, U_in)
-		implicit none
-		type(Meshh), intent(in) :: mesh
-		type(SIMPLEState), intent(inout) :: ss
-		type(BoundaryCondition), intent(in) :: bcs(:)
-		type(Fluidd), intent(in) :: fluid
-		real(kind=8), intent(in) :: U_in(3)
-		integer :: b, fi, face_idx, oc
-		real(kind=8) :: fn(3), fn_m, rho, flux_in, flux_out, ratio
-		real(kind=8) :: fv(3), A_out_total
-		
-		rho = ss%rho_ref
-		flux_in = 0.0d0
-		flux_out = 0.0d0
-		A_out_total = 0.0d0
-		
-		! 计算入口和出口总质量通量
+		! 更新边界面通量
 		do b = 1, min(ss%nBoundaries, size(bcs))
 			do fi = 1, size(mesh%boundaryFaces, 2)
 				face_idx = mesh%boundaryFaces(b, fi)
 				if (face_idx == 0) exit
-				if (face_idx < 1 .or. face_idx > ss%nFaces) cycle
+				if (face_idx<1.or.face_idx>ss%nFaces) cycle
 				oc = mesh%faces(face_idx, 1)
-				if (oc < 1 .or. oc > ss%nCells) cycle
+				if (oc<1.or.oc>ss%nCells) cycle
 				fn = mesh%fAVecs(face_idx,:)
 				
 				select case(bcs(b)%type)
+				case(wallBoundary, emptyBoundary)
+					ss%phi_f(face_idx) = 0.0d0
 				case(InletBoundary)
-					flux_in = flux_in + rho * dot_product(U_in, fn)
+					ss%phi_f(face_idx) = rho * dot_product(U_in, fn)
 				case(OutletBoundary)
 					fv = (/ss%u(oc), ss%v(oc), ss%w(oc)/)
-					flux_out = flux_out + rho * dot_product(fv, fn)
-					A_out_total = A_out_total + mag(fn)
+					ss%phi_f(face_idx) = rho * dot_product(fv, fn)
 				end select
 			end do
 		end do
 		
-		! 如果出口通量不为零，按比例缩放出口单元速度
-		if (abs(flux_out) > 1.0d-20 .and. A_out_total > 1.0d-20) then
-			! flux_in（负值=流入） + flux_out（正值=流出）应=0
-			! 需要出口通量 = -flux_in，即缩放比 = -flux_in/flux_out
-			ratio = -flux_in / flux_out
-			if (ratio > 0.0d0 .and. ratio < 10.0d0) then
+		deallocate(gP, gPp)
+	end subroutine simple2_pressure
+
+!-----------------------------------------------------------------------
+! 步骤3：全局质量通量修正——确保出入口通量平衡
+!-----------------------------------------------------------------------
+	subroutine simple2_mass_fix(mesh, ss, bcs, rho, U_in)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(inout) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		real(kind=8), intent(in) :: rho, U_in(3)
+		integer :: b, fi, face_idx, oc
+		real(kind=8) :: fn(3), flux_in, flux_out, corr
+		
+		flux_in = 0.0d0; flux_out = 0.0d0
+		
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx<1.or.face_idx>ss%nFaces) cycle
+				
+				select case(bcs(b)%type)
+				case(InletBoundary)
+					flux_in = flux_in + ss%phi_f(face_idx)
+				case(OutletBoundary)
+					flux_out = flux_out + ss%phi_f(face_idx)
+				end select
+			end do
+		end do
+		
+		! 修正出口面通量使总和为零
+		if (abs(flux_out) > 1.0d-20) then
+			corr = -flux_in / flux_out
+			if (corr > 0.5d0 .and. corr < 2.0d0) then
 				do b = 1, min(ss%nBoundaries, size(bcs))
 					if (bcs(b)%type /= OutletBoundary) cycle
 					do fi = 1, size(mesh%boundaryFaces, 2)
 						face_idx = mesh%boundaryFaces(b, fi)
 						if (face_idx == 0) exit
-						if (face_idx < 1 .or. face_idx > ss%nFaces) cycle
+						if (face_idx<1.or.face_idx>ss%nFaces) cycle
 						oc = mesh%faces(face_idx, 1)
-						if (oc < 1 .or. oc > ss%nCells) cycle
-						ss%u(oc) = ss%u(oc) * ratio
-						ss%v(oc) = ss%v(oc) * ratio
-						ss%w(oc) = ss%w(oc) * ratio
+						if (oc<1.or.oc>ss%nCells) cycle
+						ss%phi_f(face_idx) = ss%phi_f(face_idx) * corr
+						ss%u(oc) = ss%u(oc) * corr
+						ss%v(oc) = ss%v(oc) * corr
+						ss%w(oc) = ss%w(oc) * corr
 					end do
 				end do
 			end if
 		end if
-	end subroutine simple_correct_mass_flux
+	end subroutine simple2_mass_fix
 
+!-----------------------------------------------------------------------
+! 湍流更新（复用之前的）
+!-----------------------------------------------------------------------
 	subroutine simple_turbulence(mesh, ss, fluid)
 		implicit none
 		type(Meshh), intent(in) :: mesh
@@ -4875,6 +4933,9 @@ function triangleCentroid(points)
 		deallocate(gradU)
 	end subroutine simple_turbulence
 
+!-----------------------------------------------------------------------
+! VTK 输出
+!-----------------------------------------------------------------------
 	subroutine simple_writeVTK(mesh, ss, meshPath, output_count, fluid)
 		implicit none
 		type(Meshh), intent(in) :: mesh
@@ -4887,10 +4948,10 @@ function triangleCentroid(points)
 		character(len=256) :: vn
 		
 		allocate(prims(ss%nCells, 7))
-		prims(:,1)=ss%p + ss%p_ref  ! 输出绝对压力（表压+参考压力）
-		prims(:,2)=(ss%p + ss%p_ref)/(fluid%R*ss%rho_ref)
-		prims(:,3)=ss%u; prims(:,4)=ss%v; prims(:,5)=ss%w
-		prims(:,6)=ss%k; prims(:,7)=ss%omega
+		prims(:,1) = ss%p + ss%p_ref
+		prims(:,2) = (ss%p + ss%p_ref) / (fluid%R * ss%rho_ref)
+		prims(:,3) = ss%u; prims(:,4) = ss%v; prims(:,5) = ss%w
+		prims(:,6) = ss%k; prims(:,7) = ss%omega
 		allocate(st%cellMuT(ss%nCells), st%cellYplus(ss%nCells))
 		st%cellMuT = ss%mu_t; st%cellYplus = 0.0d0
 		write(vn,'(A,I0)') 'solution_SIMPLE.', output_count
@@ -4898,47 +4959,6 @@ function triangleCentroid(points)
 		call outputVTK_RANS(meshPath, prims, st, vn)
 		deallocate(prims, st%cellMuT, st%cellYplus)
 	end subroutine simple_writeVTK
-
-	subroutine simple_diagnose_boundary(mesh, ss, bcs, fluid, U_in)
-		implicit none
-		type(Meshh), intent(in) :: mesh
-		type(SIMPLEState), intent(in) :: ss
-		type(BoundaryCondition), intent(in) :: bcs(:)
-		type(Fluidd), intent(in) :: fluid
-		real(kind=8), intent(in) :: U_in(3)
-		integer :: b, fi, face_idx, oc, nf
-		real(kind=8) :: fn(3), rho, flux_total, fv(3)
-		real(kind=8) :: A_sum(3)
-		
-		rho = ss%rho_ref
-		print *, '=== 边界面诊断 ==='
-		do b = 1, min(ss%nBoundaries, size(bcs))
-			flux_total = 0.0d0
-			A_sum = 0.0d0
-			nf = 0
-			do fi = 1, size(mesh%boundaryFaces, 2)
-				face_idx = mesh%boundaryFaces(b, fi)
-				if (face_idx == 0) exit
-				if (face_idx < 1 .or. face_idx > ss%nFaces) cycle
-				oc = mesh%faces(face_idx, 1)
-				if (oc < 1 .or. oc > ss%nCells) cycle
-				fn = mesh%fAVecs(face_idx,:)
-				A_sum = A_sum + fn
-				nf = nf + 1
-				select case(bcs(b)%type)
-				case(InletBoundary)
-					flux_total = flux_total + rho * dot_product(U_in, fn)
-				case(OutletBoundary)
-					fv = (/ss%u(oc), ss%v(oc), ss%w(oc)/)
-					flux_total = flux_total + rho * dot_product(fv, fn)
-				end select
-			end do
-			write(*,'(A,I2,A,I2,A,I6,A,3ES11.3,A,ES11.3)') &
-				'  BC ', b, ' type=', bcs(b)%type, ' nf=', nf, &
-				' A=', A_sum, ' flux=', flux_total
-		end do
-		print *, '=== end 诊断 ==='
-	end subroutine simple_diagnose_boundary
 
 !===============================================================================
 ! SECTION 13: TURKEL LOW-MACH PRECONDITIONING (for density-based solver)
