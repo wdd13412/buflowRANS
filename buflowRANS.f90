@@ -26,6 +26,32 @@ module BuFlowModule
     real(kind=8), parameter :: CAPPA = 0.09d0       ! k-omega model constant
     real(kind=8), parameter :: SMALL_NUM = 1.0d-20  ! Small number for divisions
     real(kind=8), parameter :: Y_PLUS_LAMINAR = 11.63d0  ! y+ transition
+    
+    !===========================================================================
+    ! Solver type switch
+    !===========================================================================
+    integer, parameter :: SOLVER_DENSITY_BASED = 1
+    integer, parameter :: SOLVER_SIMPLE = 2
+    integer, parameter :: SOLVER_TYPE = SOLVER_SIMPLE
+    
+    !===========================================================================
+    ! Turkel low-Mach preconditioning (for density-based solver)
+    !===========================================================================
+    logical, parameter :: LOW_MACH_PRECOND = .true.
+    real(kind=8), parameter :: M_CUTOFF = 0.01d0
+    
+    !===========================================================================
+    ! SIMPLE solver parameters
+    !===========================================================================
+    real(kind=8), parameter :: SIMPLE_ALPHA_U = 0.3d0
+    real(kind=8), parameter :: SIMPLE_ALPHA_P = 0.05d0
+    real(kind=8), parameter :: SIMPLE_ALPHA_K = 0.5d0
+    real(kind=8), parameter :: SIMPLE_ALPHA_OMEGA = 0.5d0
+    integer, parameter :: SIMPLE_MAX_ITER = 2000
+    integer, parameter :: SIMPLE_MAX_INNER_U = 3
+    integer, parameter :: SIMPLE_MAX_INNER_P = 50
+    real(kind=8), parameter :: SIMPLE_TOLERANCE = 1.0d-6
+    integer, parameter :: SIMPLE_OUTPUT_INTERVAL = 50
     !===========================================================================
     
 	type Celll
@@ -116,6 +142,19 @@ module BuFlowModule
 		logical :: needTruncate
 		real(kind=8) :: actualDt
 	end type RestrictResult
+	
+	type SIMPLEState
+		integer :: nCells, nFaces, nBoundaries, nBdryFaces
+		real(kind=8), allocatable :: p(:)
+		real(kind=8), allocatable :: u(:), v(:), w(:)
+		real(kind=8), allocatable :: k(:), omega(:)
+		real(kind=8), allocatable :: mu_t(:), mu_l(:)
+		real(kind=8), allocatable :: p_prime(:)
+		real(kind=8), allocatable :: aP_u(:)
+		real(kind=8), allocatable :: rho_field(:)
+		real(kind=8) :: rho_ref
+		real(kind=8) :: p_ref
+	end type SIMPLEState
 	
 	interface dot
 		module procedure dot_vec_vec
@@ -320,7 +359,13 @@ contains
 			end if
 			
 			a = sqrt(fluid%gammaa * fluid%R * faceT)
-			flux = flux + mag(mesh%fAVecs(f,:)) * a * dt_val
+			if (LOW_MACH_PRECOND) then
+				flux = flux + mag(mesh%fAVecs(f,:)) * &
+					preconditioned_spectral_radius(mag(faceVel), a, fluid%gammaa) * dt_val - &
+					abs(dot_product(faceVel, mesh%fAVecs(f,:))) * dt_val
+			else
+				flux = flux + mag(mesh%fAVecs(f,:)) * a * dt_val
+			end if
 			
 			!--- RANS k-omega: Add viscous contribution to CFL ---
 			! mu_eff = mu_laminar + mu_turbulent
@@ -539,7 +584,7 @@ contains
 		timeIntegrationFn = 'LTSEuler'
 		fluxFunction = 'unstructured_JSTFlux_RANS'  ! Modified for RANS
 		initDt = 0.0000001
-		endTime = 5000
+		endTime = 350
 		outputInterval = 25
 		targetCFL = 0.5d0
 		fluid = fluiddd()
@@ -1398,7 +1443,10 @@ end subroutine decodePrimitives3D_RANS
 		
 		allocate(rj(nCells))
 		do c = 1, nCells
-			rj(c) = mag(sln%cellPrimitives(c,3:5)) + sqrt(fluid%gammaa * fluid%R * sln%cellPrimitives(c,2))
+			rj(c) = preconditioned_spectral_radius( &
+				mag(sln%cellPrimitives(c,3:5)), &
+				sqrt(fluid%gammaa * fluid%R * sln%cellPrimitives(c,2)), &
+				fluid%gammaa)
 			if(sjCount(c) > 0) then
 				sj(c) = sj(c) / sjCount(c)
 			end if
@@ -4271,28 +4319,517 @@ function triangleCentroid(points)
 	print *, "  Number of faces: ", size(mesh%faces, 1)
 	print *, "  Cell volume range: ", minval(mesh%cVols), maxval(mesh%cVols)
 
-	! Initialize uniform solution (now includes k and omega)
-	print *, "=== Initializing uniform solution ==="
 	print *, "  P = ", P
 	print *, "  T = ", T
 	print *, "  U = ", U
 	print *, "  k_init = ", k_init
 	print *, "  omega_init = ", omega_init
-		
-		! Initialize uniform solution (now includes k and omega)
-		cellPrimitives = initializeUniformSolution3D(mesh, P, T, U(1), U(2), U(3), k_init, omega_init)
-		print *, "=== Solution initialized ==="
-		print *, "  Array size: ", size(cellPrimitives, 1), "x", size(cellPrimitives, 2)
-		print *, "  First row: ", cellPrimitives(1, :)
-		print *, "  Pressure range: ", minval(cellPrimitives(:,1)), maxval(cellPrimitives(:,1))
-		print *, "  Temperature range: ", minval(cellPrimitives(:,2)), maxval(cellPrimitives(:,2))
-		! after cellPrimitives = initializeUniformSolution3D(...)
 
-		! Call RANS solver
-		call solve(mesh, meshPath, cellPrimitives, boundaryConditions)
+		! Dispatch to selected solver
+		if (SOLVER_TYPE == SOLVER_SIMPLE) then
+			print *, ''
+			print *, '>>> Using SIMPLE pressure-based solver (low Mach) <<<'
+			call solve_SIMPLE(mesh, meshPath, boundaryConditions, fluid, &
+			                  P, T, U, k_init, omega_init)
+		else
+			print *, ''
+			print *, '>>> Using density-based solver <<<'
+			cellPrimitives = initializeUniformSolution3D(mesh, P, T, U(1), U(2), U(3), k_init, omega_init)
+			call solve(mesh, meshPath, cellPrimitives, boundaryConditions)
+		end if
 		
 		if (allocated(boundaryConditions)) deallocate(boundaryConditions)
 	end subroutine compute_CFD_RANS
+
+
+!===============================================================================
+! SECTION 12: SIMPLE PRESSURE-BASED SOLVER FOR LOW MACH NUMBER
+!===============================================================================
+
+	subroutine solve_SIMPLE(mesh, meshPath, boundaryConditions, fluid, &
+	                        P_init, T_init, U_init, k_init, omega_init)
+		implicit none
+		type(Meshh), intent(inout) :: mesh
+		character(len=*), intent(in) :: meshPath
+		type(BoundaryCondition), intent(in) :: boundaryConditions(:)
+		type(Fluidd), intent(in) :: fluid
+		real(kind=8), intent(in) :: P_init, T_init, U_init(3), k_init, omega_init
+		
+		type(SIMPLEState) :: ss
+		integer(kind=8) :: meshInfo(4)
+		integer :: iter, c
+		real(kind=8) :: res_u, res_v, res_w, res_p, res_max
+		real(kind=8), allocatable :: u_old(:), v_old(:), w_old(:), p_old(:)
+		integer :: output_count
+		
+		meshInfo = unstructuredMeshInfo(mesh)
+		ss%nCells = int(meshInfo(1))
+		ss%nFaces = int(meshInfo(2))
+		ss%nBoundaries = int(meshInfo(3))
+		ss%nBdryFaces = int(meshInfo(4))
+		
+		call computeWallDistances(mesh)
+		
+		ss%rho_ref = P_init / (fluid%R * T_init)
+		ss%p_ref = P_init
+		
+		allocate(ss%p(ss%nCells), ss%u(ss%nCells), ss%v(ss%nCells), ss%w(ss%nCells))
+		allocate(ss%k(ss%nCells), ss%omega(ss%nCells))
+		allocate(ss%mu_t(ss%nCells), ss%mu_l(ss%nCells))
+		allocate(ss%p_prime(ss%nCells), ss%aP_u(ss%nCells))
+		allocate(ss%rho_field(ss%nCells))
+		allocate(u_old(ss%nCells), v_old(ss%nCells), w_old(ss%nCells), p_old(ss%nCells))
+		
+		ss%p = P_init
+		ss%u = U_init(1)
+		ss%v = U_init(2)
+		ss%w = U_init(3)
+		ss%k = k_init
+		ss%omega = omega_init
+		ss%rho_field = ss%rho_ref
+		ss%mu_l = fluid%mu_laminar
+		do c = 1, ss%nCells
+			ss%mu_t(c) = ss%rho_ref * k_init / max(omega_init, SMALL_NUM)
+			ss%mu_t(c) = min(ss%mu_t(c), 1.0d4 * ss%mu_l(c))
+		end do
+		ss%aP_u = 1.0d0
+		ss%p_prime = 0.0d0
+		
+		print *, ''
+		print *, '=========================================='
+		print *, ' SIMPLE Pressure-Based Solver'
+		print *, '=========================================='
+		print *, '  Cells:', ss%nCells, ' Faces:', ss%nFaces
+		print *, '  rho_ref =', ss%rho_ref
+		print *, '  U_ref   =', mag(U_init)
+		print *, ''
+		
+		output_count = 0
+		
+		do iter = 1, SIMPLE_MAX_ITER
+			u_old = ss%u
+			v_old = ss%v
+			w_old = ss%w
+			p_old = ss%p
+			
+			do c = 1, ss%nCells
+				ss%mu_t(c) = ss%rho_ref * max(ss%k(c), SMALL_NUM) / max(ss%omega(c), SMALL_NUM)
+				ss%mu_t(c) = min(ss%mu_t(c), 1.0d4 * ss%mu_l(c))
+			end do
+			
+			call simple_momentum_all(mesh, ss, boundaryConditions, fluid, U_init)
+			call simple_pressure_correct(mesh, ss, boundaryConditions, fluid, U_init)
+			
+			if (mod(iter, 10) == 0) then
+				call simple_turbulence(mesh, ss, fluid)
+			end if
+			
+			res_u = maxval(abs(ss%u - u_old)) / max(maxval(abs(ss%u)), 1.0d-10)
+			res_v = maxval(abs(ss%v - v_old)) / max(maxval(abs(ss%v)), 1.0d-10)
+			res_w = maxval(abs(ss%w - w_old)) / max(maxval(abs(ss%w)), 1.0d-10)
+			res_p = maxval(abs(ss%p - p_old)) / max(maxval(abs(ss%p)), 1.0d-10)
+			res_max = max(res_u, res_v, res_w, res_p)
+			
+			if (mod(iter, 10) == 0 .or. iter <= 5) then
+				write(*,'(A,I6,A,4ES12.4)') ' SIMPLE iter=', iter, &
+					'  res(u,v,w,p)=', res_u, res_v, res_w, res_p
+			end if
+			
+			if (mod(iter, SIMPLE_OUTPUT_INTERVAL) == 0) then
+				output_count = output_count + 1
+				call simple_writeVTK(mesh, ss, meshPath, output_count, fluid)
+			end if
+			
+			if (res_max < SIMPLE_TOLERANCE .and. iter > 20) then
+				print *, '=== SIMPLE converged at iteration', iter, ' ==='
+				exit
+			end if
+			
+			if (any(ss%u /= ss%u) .or. any(ss%p /= ss%p)) then
+				print *, 'ERROR: NaN detected at iteration', iter
+				print *, '  aP_u range:', minval(ss%aP_u), maxval(ss%aP_u)
+				print *, '  p_prime range:', minval(ss%p_prime), maxval(ss%p_prime)
+				print *, '  P range:', minval(ss%p), maxval(ss%p)
+				print *, '  U range:', minval(ss%u), maxval(ss%u)
+				exit
+			end if
+		end do
+		
+		print *, ''
+		print *, '=== SIMPLE Solution Summary ==='
+		print *, '  P range :', minval(ss%p), maxval(ss%p)
+		print *, '  U range :', minval(ss%u), maxval(ss%u)
+		print *, '  V range :', minval(ss%v), maxval(ss%v)
+		print *, '  |V| max :', maxval(sqrt(ss%u**2 + ss%v**2 + ss%w**2))
+		
+		output_count = output_count + 1
+		call simple_writeVTK(mesh, ss, meshPath, output_count, fluid)
+		
+		deallocate(ss%p, ss%u, ss%v, ss%w, ss%k, ss%omega)
+		deallocate(ss%mu_t, ss%mu_l, ss%p_prime, ss%aP_u, ss%rho_field)
+		deallocate(u_old, v_old, w_old, p_old)
+	end subroutine solve_SIMPLE
+
+	subroutine simple_momentum_all(mesh, ss, bcs, fluid, U_in)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(inout) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		type(Fluidd), intent(in) :: fluid
+		real(kind=8), intent(in) :: U_in(3)
+		
+		integer :: c, f, b, fi, face_idx, oc, nc, gs, idx
+		integer :: nInt
+		real(kind=8) :: rho, mu_e, d_m, fc, a_d
+		real(kind=8) :: fn(3), fn_m, fv(3), nb_s
+		integer, parameter :: MNB = 30
+		real(kind=8) :: aP(ss%nCells), bU(ss%nCells), bV(ss%nCells), bW(ss%nCells)
+		real(kind=8) :: aN_c(ss%nCells, MNB)
+		integer :: aN_i(ss%nCells, MNB), aN_n(ss%nCells)
+		real(kind=8), allocatable :: gP(:,:), pm(:,:), tg(:,:,:)
+		
+		nInt = ss%nFaces - ss%nBdryFaces
+		rho = ss%rho_ref
+		
+		allocate(pm(ss%nCells, 1))
+		pm(:,1) = ss%p
+		allocate(tg(ss%nCells, 1, 3))
+		tg = greenGaussGrad_RANS(mesh, pm, .false.)
+		allocate(gP(ss%nCells, 3))
+		gP(:,1) = tg(:,1,1); gP(:,2) = tg(:,1,2); gP(:,3) = tg(:,1,3)
+		deallocate(tg, pm)
+		
+		aP = 0.0d0
+		bU = 0.0d0; bV = 0.0d0; bW = 0.0d0
+		aN_c = 0.0d0; aN_i = 0; aN_n = 0
+		
+		do c = 1, ss%nCells
+			bU(c) = -gP(c,1) * mesh%cVols(c)
+			bV(c) = -gP(c,2) * mesh%cVols(c)
+			bW(c) = -gP(c,3) * mesh%cVols(c)
+		end do
+		
+		do f = 1, nInt
+			oc = mesh%faces(f, 1)
+			nc = mesh%faces(f, 2)
+			if (oc < 1 .or. oc > ss%nCells .or. nc < 1 .or. nc > ss%nCells) cycle
+			
+			fn = mesh%fAVecs(f,:)
+			fn_m = mag(fn)
+			if (fn_m < 1.0d-30) cycle
+			d_m = mag(mesh%cCenters(nc,:) - mesh%cCenters(oc,:))
+			if (d_m < 1.0d-30) cycle
+			
+			mu_e = 0.5d0 * (ss%mu_l(oc)+ss%mu_t(oc)+ss%mu_l(nc)+ss%mu_t(nc))
+			fv(1) = 0.5d0*(ss%u(oc)+ss%u(nc))
+			fv(2) = 0.5d0*(ss%v(oc)+ss%v(nc))
+			fv(3) = 0.5d0*(ss%w(oc)+ss%w(nc))
+			fc = rho * dot_product(fv, fn)
+			a_d = mu_e * fn_m / d_m
+			
+			if (aN_n(oc) < MNB) then
+				aN_n(oc) = aN_n(oc) + 1
+				aN_i(oc, aN_n(oc)) = nc
+				aN_c(oc, aN_n(oc)) = a_d + max(-fc, 0.0d0)
+			end if
+			aP(oc) = aP(oc) + a_d + max(fc, 0.0d0)
+			
+			if (aN_n(nc) < MNB) then
+				aN_n(nc) = aN_n(nc) + 1
+				aN_i(nc, aN_n(nc)) = oc
+				aN_c(nc, aN_n(nc)) = a_d + max(fc, 0.0d0)
+			end if
+			aP(nc) = aP(nc) + a_d + max(-fc, 0.0d0)
+		end do
+		
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx < 1 .or. face_idx > ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1)
+				if (oc < 1 .or. oc > ss%nCells) cycle
+				fn = mesh%fAVecs(face_idx,:)
+				fn_m = mag(fn)
+				if (fn_m < 1.0d-30) cycle
+				d_m = max(mag(mesh%fCenters(face_idx,:)-mesh%cCenters(oc,:)), 1.0d-10)
+				mu_e = ss%mu_l(oc) + ss%mu_t(oc)
+				
+				select case(bcs(b)%type)
+				case(wallBoundary)
+					a_d = mu_e * fn_m / d_m
+					aP(oc) = aP(oc) + a_d
+				case(InletBoundary)
+					a_d = mu_e * fn_m / d_m
+					fc = rho * dot_product(U_in, fn)
+					a_d = a_d + max(fc, 0.0d0)
+					aP(oc) = aP(oc) + a_d
+					bU(oc) = bU(oc) + a_d * U_in(1)
+					bV(oc) = bV(oc) + a_d * U_in(2)
+					bW(oc) = bW(oc) + a_d * U_in(3)
+				case(OutletBoundary)
+					fv = (/ss%u(oc), ss%v(oc), ss%w(oc)/)
+					fc = rho * dot_product(fv, fn)
+					if (fc > 0.0d0) aP(oc) = aP(oc) + fc
+				case(emptyBoundary)
+					continue
+				end select
+			end do
+		end do
+		
+		do c = 1, ss%nCells
+			aP(c) = max(aP(c), 1.0d-10)
+		end do
+		ss%aP_u = aP / SIMPLE_ALPHA_U
+		
+		do c = 1, ss%nCells
+			bU(c) = bU(c) + (1.0d0-SIMPLE_ALPHA_U)*ss%aP_u(c)*ss%u(c)
+			bV(c) = bV(c) + (1.0d0-SIMPLE_ALPHA_U)*ss%aP_u(c)*ss%v(c)
+			bW(c) = bW(c) + (1.0d0-SIMPLE_ALPHA_U)*ss%aP_u(c)*ss%w(c)
+		end do
+		
+		do gs = 1, SIMPLE_MAX_INNER_U
+			do c = 1, ss%nCells
+				nb_s = 0.0d0
+				do idx = 1, aN_n(c)
+					nb_s = nb_s + aN_c(c,idx)*ss%u(aN_i(c,idx))
+				end do
+				ss%u(c) = (bU(c) + nb_s) / ss%aP_u(c)
+			end do
+			do c = 1, ss%nCells
+				nb_s = 0.0d0
+				do idx = 1, aN_n(c)
+					nb_s = nb_s + aN_c(c,idx)*ss%v(aN_i(c,idx))
+				end do
+				ss%v(c) = (bV(c) + nb_s) / ss%aP_u(c)
+			end do
+			do c = 1, ss%nCells
+				nb_s = 0.0d0
+				do idx = 1, aN_n(c)
+					nb_s = nb_s + aN_c(c,idx)*ss%w(aN_i(c,idx))
+				end do
+				ss%w(c) = (bW(c) + nb_s) / ss%aP_u(c)
+			end do
+		end do
+		
+		deallocate(gP)
+	end subroutine simple_momentum_all
+
+	subroutine simple_pressure_correct(mesh, ss, bcs, fluid, U_in)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(inout) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		type(Fluidd), intent(in) :: fluid
+		real(kind=8), intent(in) :: U_in(3)
+		
+		integer :: c, f, b, fi, face_idx, oc, nc, gs, idx, nInt
+		real(kind=8) :: rho, fn(3), fn_m, d_m, D_f, flux_s, fv(3), D_c
+		integer, parameter :: MNB = 30
+		real(kind=8) :: aP_pp(ss%nCells), src(ss%nCells)
+		real(kind=8) :: aN_pp(ss%nCells, MNB)
+		integer :: nb_i(ss%nCells, MNB), nb_n(ss%nCells)
+		real(kind=8) :: nb_s
+		real(kind=8), allocatable :: gP(:,:), gPp(:,:), pm(:,:), tg(:,:,:)
+		
+		nInt = ss%nFaces - ss%nBdryFaces
+		rho = ss%rho_ref
+		
+		allocate(pm(ss%nCells, 1))
+		pm(:,1) = ss%p
+		allocate(tg(ss%nCells, 1, 3))
+		tg = greenGaussGrad_RANS(mesh, pm, .false.)
+		allocate(gP(ss%nCells, 3))
+		gP(:,1) = tg(:,1,1); gP(:,2) = tg(:,1,2); gP(:,3) = tg(:,1,3)
+		deallocate(tg, pm)
+		
+		aP_pp = 0.0d0; src = 0.0d0
+		aN_pp = 0.0d0; nb_i = 0; nb_n = 0
+		ss%p_prime = 0.0d0
+		
+		do f = 1, nInt
+			oc = mesh%faces(f, 1); nc = mesh%faces(f, 2)
+			if (oc<1.or.oc>ss%nCells.or.nc<1.or.nc>ss%nCells) cycle
+			fn = mesh%fAVecs(f,:); fn_m = mag(fn)
+			if (fn_m < 1.0d-30) cycle
+			d_m = mag(mesh%cCenters(nc,:)-mesh%cCenters(oc,:))
+			if (d_m < 1.0d-30) cycle
+			
+			D_f = 0.5d0*(mesh%cVols(oc)/ss%aP_u(oc) + mesh%cVols(nc)/ss%aP_u(nc))
+			fv(1)=0.5d0*(ss%u(oc)+ss%u(nc))
+			fv(2)=0.5d0*(ss%v(oc)+ss%v(nc))
+			fv(3)=0.5d0*(ss%w(oc)+ss%w(nc))
+			
+			flux_s = rho*dot_product(fv, fn) &
+				- rho*D_f*((ss%p(nc)-ss%p(oc))/d_m*fn_m &
+				  - dot_product(0.5d0*(gP(oc,:)+gP(nc,:)), fn))
+			
+			src(oc) = src(oc) - flux_s
+			src(nc) = src(nc) + flux_s
+			
+			D_f = rho * D_f * fn_m / d_m
+			aP_pp(oc) = aP_pp(oc) + D_f
+			aP_pp(nc) = aP_pp(nc) + D_f
+			
+			if (nb_n(oc)<MNB) then
+				nb_n(oc)=nb_n(oc)+1; nb_i(oc,nb_n(oc))=nc; aN_pp(oc,nb_n(oc))=D_f
+			end if
+			if (nb_n(nc)<MNB) then
+				nb_n(nc)=nb_n(nc)+1; nb_i(nc,nb_n(nc))=oc; aN_pp(nc,nb_n(nc))=D_f
+			end if
+		end do
+		
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx<1.or.face_idx>ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1)
+				if (oc<1.or.oc>ss%nCells) cycle
+				fn = mesh%fAVecs(face_idx,:); fn_m = mag(fn)
+				if (fn_m < 1.0d-30) cycle
+				
+				select case(bcs(b)%type)
+				case(wallBoundary, emptyBoundary)
+					continue
+				case(InletBoundary)
+					flux_s = rho * dot_product(U_in, fn)
+					src(oc) = src(oc) - flux_s
+				case(OutletBoundary)
+					fv = (/ss%u(oc), ss%v(oc), ss%w(oc)/)
+					flux_s = rho * dot_product(fv, fn)
+					src(oc) = src(oc) - flux_s
+				end select
+			end do
+		end do
+		
+		do c = 1, ss%nCells
+			if (aP_pp(c) < 1.0d-30) aP_pp(c) = 1.0d0
+		end do
+		
+		do gs = 1, SIMPLE_MAX_INNER_P
+			do c = 1, ss%nCells
+				nb_s = 0.0d0
+				do idx = 1, nb_n(c)
+					nb_s = nb_s + aN_pp(c,idx)*ss%p_prime(nb_i(c,idx))
+				end do
+				ss%p_prime(c) = (src(c) + nb_s) / aP_pp(c)
+			end do
+		end do
+		
+		ss%p = ss%p + SIMPLE_ALPHA_P * ss%p_prime
+		
+		allocate(pm(ss%nCells, 1))
+		pm(:,1) = ss%p_prime
+		allocate(tg(ss%nCells, 1, 3))
+		tg = greenGaussGrad_RANS(mesh, pm, .false.)
+		allocate(gPp(ss%nCells, 3))
+		gPp(:,1) = tg(:,1,1); gPp(:,2) = tg(:,1,2); gPp(:,3) = tg(:,1,3)
+		deallocate(tg, pm)
+		
+		do c = 1, ss%nCells
+			D_c = mesh%cVols(c) / ss%aP_u(c)
+			ss%u(c) = ss%u(c) - D_c*gPp(c,1)
+			ss%v(c) = ss%v(c) - D_c*gPp(c,2)
+			ss%w(c) = ss%w(c) - D_c*gPp(c,3)
+			ss%u(c) = max(-500.0d0, min(500.0d0, ss%u(c)))
+			ss%v(c) = max(-500.0d0, min(500.0d0, ss%v(c)))
+			ss%w(c) = max(-500.0d0, min(500.0d0, ss%w(c)))
+		end do
+		
+		deallocate(gP, gPp)
+	end subroutine simple_pressure_correct
+
+	subroutine simple_turbulence(mesh, ss, fluid)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(inout) :: ss
+		type(Fluidd), intent(in) :: fluid
+		integer :: c, i, j
+		real(kind=8) :: rho, S_mag, P_k, k_new, omega_new
+		real(kind=8), allocatable :: gradU(:,:,:), vel(:,:)
+		real(kind=8) :: gU(3,3), S(3,3)
+		
+		rho = ss%rho_ref
+		allocate(vel(ss%nCells, 3))
+		vel(:,1) = ss%u; vel(:,2) = ss%v; vel(:,3) = ss%w
+		allocate(gradU(ss%nCells, 3, 3))
+		gradU = greenGaussGrad_RANS(mesh, vel, .false.)
+		deallocate(vel)
+		
+		do c = 1, ss%nCells
+			gU = gradU(c,:,:)
+			S_mag = 0.0d0
+			do i = 1, 3
+				do j = 1, 3
+					S(i,j) = 0.5d0*(gU(i,j)+gU(j,i))
+					S_mag = S_mag + S(i,j)**2
+				end do
+			end do
+			S_mag = sqrt(2.0d0 * S_mag)
+			
+			P_k = ss%mu_t(c) * S_mag**2
+			P_k = min(P_k, 10.0d0*BETA_STAR*rho*ss%omega(c)*max(ss%k(c),SMALL_NUM))
+			
+			k_new = P_k / max(BETA_STAR*rho*ss%omega(c), SMALL_NUM)
+			k_new = max(k_new, SMALL_NUM)
+			ss%k(c) = ss%k(c) + SIMPLE_ALPHA_K*(k_new - ss%k(c))
+			ss%k(c) = max(ss%k(c), SMALL_NUM)
+			
+			omega_new = ALPHA*S_mag**2 / max(BETA*ss%omega(c), SMALL_NUM)
+			omega_new = max(omega_new, SMALL_NUM)
+			ss%omega(c) = ss%omega(c) + SIMPLE_ALPHA_OMEGA*(omega_new - ss%omega(c))
+			ss%omega(c) = max(ss%omega(c), SMALL_NUM)
+		end do
+		deallocate(gradU)
+	end subroutine simple_turbulence
+
+	subroutine simple_writeVTK(mesh, ss, meshPath, output_count, fluid)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(in) :: ss
+		character(len=*), intent(in) :: meshPath
+		integer, intent(in) :: output_count
+		type(Fluidd), intent(in) :: fluid
+		real(kind=8), allocatable :: prims(:,:)
+		type(SolutionState) :: st
+		character(len=256) :: vn
+		
+		allocate(prims(ss%nCells, 7))
+		prims(:,1)=ss%p; prims(:,2)=ss%p/(fluid%R*ss%rho_ref)
+		prims(:,3)=ss%u; prims(:,4)=ss%v; prims(:,5)=ss%w
+		prims(:,6)=ss%k; prims(:,7)=ss%omega
+		allocate(st%cellMuT(ss%nCells), st%cellYplus(ss%nCells))
+		st%cellMuT = ss%mu_t; st%cellYplus = 0.0d0
+		write(vn,'(A,I0)') 'solution_SIMPLE.', output_count
+		print *, 'Writing ', trim(vn)
+		call outputVTK_RANS(meshPath, prims, st, vn)
+		deallocate(prims, st%cellMuT, st%cellYplus)
+	end subroutine simple_writeVTK
+
+
+!===============================================================================
+! SECTION 13: TURKEL LOW-MACH PRECONDITIONING (for density-based solver)
+!===============================================================================
+
+	function preconditioned_spectral_radius(V_mag, a, gamma) result(rho_p)
+		implicit none
+		real(kind=8), intent(in) :: V_mag, a, gamma
+		real(kind=8) :: rho_p
+		real(kind=8) :: M_local, M_ref, alpha2, cprime
+		
+		if (.not. LOW_MACH_PRECOND) then
+			rho_p = V_mag + a
+			return
+		end if
+		
+		M_local = V_mag / max(a, SMALL_NUM)
+		M_ref = max(M_local, M_CUTOFF)
+		M_ref = min(M_ref, 1.0d0)
+		alpha2 = 1.0d0 - M_ref**2
+		cprime = sqrt(((1.0d0 - alpha2) * V_mag)**2 + 4.0d0 * alpha2 * a**2)
+		rho_p = 0.5d0 * ((1.0d0 + alpha2) * V_mag + cprime)
+	end function preconditioned_spectral_radius
 
 end module BuFlowModule
 
