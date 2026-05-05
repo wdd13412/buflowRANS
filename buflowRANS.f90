@@ -47,7 +47,7 @@ module BuFlowModule
     real(kind=8), parameter :: SIMPLE_ALPHA_P = 0.05d0
     real(kind=8), parameter :: SIMPLE_ALPHA_K = 0.5d0
     real(kind=8), parameter :: SIMPLE_ALPHA_OMEGA = 0.5d0
-    integer, parameter :: SIMPLE_MAX_ITER = 1000
+    integer, parameter :: SIMPLE_MAX_ITER = 3000
     integer, parameter :: SIMPLE_MAX_INNER_U = 5
     integer, parameter :: SIMPLE_MAX_INNER_P = 200
     real(kind=8), parameter :: SIMPLE_TOLERANCE = 1.0d-6
@@ -4436,6 +4436,8 @@ function triangleCentroid(points)
 			call simple_momentum_all(mesh, ss, boundaryConditions, fluid, U_init)
 			call simple_pressure_correct(mesh, ss, boundaryConditions, fluid, U_init)
 			
+			! 无额外速度限制——靠under-relaxation控制
+			
 			if (mod(iter, 50) == 0 .and. iter > 100) then
 				call simple_turbulence(mesh, ss, fluid)
 			end if
@@ -4601,10 +4603,7 @@ function triangleCentroid(points)
 		end do
 		
 		do c = 1, ss%nCells
-			! 自适应伪瞬态：dt_local = 单元特征尺寸 / U_ref
-			! 保证每个单元（无论大小）都有足够的对角主导
-			aP(c) = aP(c) + rho * mesh%cVols(c) / &
-				max(mesh%cVols(c)**(1.0d0/3.0d0) / max(mag(U_in), 1.0d0), 1.0d-12)
+			! 无伪瞬态，靠速度变化限制器保持稳定
 			aP(c) = max(aP(c), 1.0d-10)
 		end do
 		ss%aP_u = aP / SIMPLE_ALPHA_U
@@ -4756,10 +4755,14 @@ function triangleCentroid(points)
 			end do
 		end do
 		
+		! 限制压力修正幅度（防止压力漂移）
+		do c = 1, ss%nCells
+			ss%p_prime(c) = max(-500.0d0, min(500.0d0, ss%p_prime(c)))
+		end do
 		ss%p = ss%p + SIMPLE_ALPHA_P * ss%p_prime
 		
 		! 压力参考点修正：减去平均值防止漂移
-		ss%p = ss%p - sum(ss%p) / ss%nCells
+		ss%p = ss%p - sum(ss%p) / dble(ss%nCells)
 		
 		allocate(pm(ss%nCells, 1))
 		pm(:,1) = ss%p_prime
@@ -4774,9 +4777,9 @@ function triangleCentroid(points)
 			ss%u(c) = ss%u(c) - D_c*gPp(c,1)
 			ss%v(c) = ss%v(c) - D_c*gPp(c,2)
 			ss%w(c) = ss%w(c) - D_c*gPp(c,3)
-			ss%u(c) = max(-200.0d0, min(200.0d0, ss%u(c)))
-			ss%v(c) = max(-200.0d0, min(200.0d0, ss%v(c)))
-			ss%w(c) = max(-200.0d0, min(200.0d0, ss%w(c)))
+			ss%u(c) = max(-50.0d0, min(50.0d0, ss%u(c)))
+			ss%v(c) = max(-50.0d0, min(50.0d0, ss%v(c)))
+			ss%w(c) = max(-50.0d0, min(50.0d0, ss%w(c)))
 		end do
 		
 		deallocate(gP, gPp)
