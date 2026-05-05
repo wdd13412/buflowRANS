@@ -1,5 +1,6 @@
-# Compiled binary
+# Compiled binary and module files
 buflowRANS
+*.mod
 
 # Solver output
 FvCFDRestart.txt
