@@ -47,9 +47,9 @@ module BuFlowModule
     real(kind=8), parameter :: SIMPLE_ALPHA_P = 0.05d0
     real(kind=8), parameter :: SIMPLE_ALPHA_K = 0.5d0
     real(kind=8), parameter :: SIMPLE_ALPHA_OMEGA = 0.5d0
-    integer, parameter :: SIMPLE_MAX_ITER = 500
+    integer, parameter :: SIMPLE_MAX_ITER = 1000
     integer, parameter :: SIMPLE_MAX_INNER_U = 5
-    integer, parameter :: SIMPLE_MAX_INNER_P = 80
+    integer, parameter :: SIMPLE_MAX_INNER_P = 200
     real(kind=8), parameter :: SIMPLE_TOLERANCE = 1.0d-6
     integer, parameter :: SIMPLE_OUTPUT_INTERVAL = 50
     !===========================================================================
@@ -4419,6 +4419,9 @@ function triangleCentroid(points)
 		
 		output_count = 0
 		
+		! 一次性诊断：检查入口/出口面积法向量
+		call simple_diagnose_boundary(mesh, ss, boundaryConditions, fluid, U_init)
+		
 		do iter = 1, SIMPLE_MAX_ITER
 			u_old = ss%u
 			v_old = ss%v
@@ -4449,22 +4452,27 @@ function triangleCentroid(points)
 					'  p=', minval(ss%p), maxval(ss%p)
 			end if
 			
-			if (mod(iter, SIMPLE_OUTPUT_INTERVAL) == 0) then
-				output_count = output_count + 1
-				call simple_writeVTK(mesh, ss, meshPath, output_count, fluid)
-			end if
+			! 循环内VTK输出已禁用，加速调试
+			! if (mod(iter, SIMPLE_OUTPUT_INTERVAL) == 0) then
+			! 	output_count = output_count + 1
+			! 	call simple_writeVTK(mesh, ss, meshPath, output_count, fluid)
+			! end if
 			
 			if (res_max < SIMPLE_TOLERANCE .and. iter > 20) then
 				print *, '=== SIMPLE converged at iteration', iter, ' ==='
 				exit
 			end if
 			
+			! 诊断：找出速度最大的单元
+			if (iter <= 15 .or. any(ss%u /= ss%u)) then
+				c = maxloc(abs(ss%u), 1)
+				write(*,'(A,I6,A,I8,A,3ES12.4,A,ES12.4,A,ES12.4)') &
+					'  DBG iter=', iter, ' maxU_cell=', c, &
+					' u,v,w=', ss%u(c), ss%v(c), ss%w(c), &
+					' aP=', ss%aP_u(c), ' Vol=', mesh%cVols(c)
+			end if
 			if (any(ss%u /= ss%u) .or. any(ss%p /= ss%p)) then
-				print *, 'ERROR: NaN detected at iteration', iter
-				print *, '  aP_u range:', minval(ss%aP_u), maxval(ss%aP_u)
-				print *, '  p_prime range:', minval(ss%p_prime), maxval(ss%p_prime)
-				print *, '  P range:', minval(ss%p), maxval(ss%p)
-				print *, '  U range:', minval(ss%u), maxval(ss%u)
+				print *, 'ERROR: NaN at iter', iter
 				exit
 			end if
 		end do
@@ -4593,8 +4601,10 @@ function triangleCentroid(points)
 		end do
 		
 		do c = 1, ss%nCells
-			! 伪瞬态对角贡献（dt_pseudo 越小越稳定但收敛越慢）
-			aP(c) = aP(c) + rho * mesh%cVols(c) / 0.001d0
+			! 自适应伪瞬态：dt_local = 单元特征尺寸 / U_ref
+			! 保证每个单元（无论大小）都有足够的对角主导
+			aP(c) = aP(c) + rho * mesh%cVols(c) / &
+				max(mesh%cVols(c)**(1.0d0/3.0d0) / max(mag(U_in), 1.0d0), 1.0d-12)
 			aP(c) = max(aP(c), 1.0d-10)
 		end do
 		ss%aP_u = aP / SIMPLE_ALPHA_U
@@ -4713,9 +4723,15 @@ function triangleCentroid(points)
 					flux_s = rho * dot_product(U_in, fn)
 					src(oc) = src(oc) - flux_s
 				case(OutletBoundary)
+					! 出口：固定压力（p'=0），添加面通量到源项
 					fv = (/ss%u(oc), ss%v(oc), ss%w(oc)/)
 					flux_s = rho * dot_product(fv, fn)
 					src(oc) = src(oc) - flux_s
+					! 出口面 p'=0 → 贡献到对角系数（类似固定值BC）
+					d_m = max(mag(mesh%fCenters(face_idx,:)-mesh%cCenters(oc,:)), 1.0d-10)
+					D_f = mesh%cVols(oc) / ss%aP_u(oc)
+					D_f = rho * D_f * fn_m / d_m
+					aP_pp(oc) = aP_pp(oc) + D_f
 				end select
 			end do
 		end do
@@ -4723,6 +4739,12 @@ function triangleCentroid(points)
 		do c = 1, ss%nCells
 			if (aP_pp(c) < 1.0d-30) aP_pp(c) = 1.0d0
 		end do
+		
+		! 诊断（仅前3次）
+		if (abs(ss%p(1)) < 1.0d3) then
+			write(*,'(A,ES12.4,A,ES12.4)') &
+				'  PP_DBG: sum(src)=', sum(src), ' max|src|=', maxval(abs(src))
+		end if
 		
 		do gs = 1, SIMPLE_MAX_INNER_P
 			do c = 1, ss%nCells
@@ -4735,6 +4757,9 @@ function triangleCentroid(points)
 		end do
 		
 		ss%p = ss%p + SIMPLE_ALPHA_P * ss%p_prime
+		
+		! 压力参考点修正：减去平均值防止漂移
+		ss%p = ss%p - sum(ss%p) / ss%nCells
 		
 		allocate(pm(ss%nCells, 1))
 		pm(:,1) = ss%p_prime
@@ -4749,13 +4774,77 @@ function triangleCentroid(points)
 			ss%u(c) = ss%u(c) - D_c*gPp(c,1)
 			ss%v(c) = ss%v(c) - D_c*gPp(c,2)
 			ss%w(c) = ss%w(c) - D_c*gPp(c,3)
-			ss%u(c) = max(-100.0d0, min(100.0d0, ss%u(c)))
-			ss%v(c) = max(-100.0d0, min(100.0d0, ss%v(c)))
-			ss%w(c) = max(-100.0d0, min(100.0d0, ss%w(c)))
+			ss%u(c) = max(-200.0d0, min(200.0d0, ss%u(c)))
+			ss%v(c) = max(-200.0d0, min(200.0d0, ss%v(c)))
+			ss%w(c) = max(-200.0d0, min(200.0d0, ss%w(c)))
 		end do
 		
 		deallocate(gP, gPp)
+		
+		! 全局质量通量修正：调整出口速度确保质量守恒
+		call simple_correct_mass_flux(mesh, ss, bcs, fluid, U_in)
 	end subroutine simple_pressure_correct
+
+	! 修正出口面速度使全局质量通量平衡
+	subroutine simple_correct_mass_flux(mesh, ss, bcs, fluid, U_in)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(inout) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		type(Fluidd), intent(in) :: fluid
+		real(kind=8), intent(in) :: U_in(3)
+		integer :: b, fi, face_idx, oc
+		real(kind=8) :: fn(3), fn_m, rho, flux_in, flux_out, ratio
+		real(kind=8) :: fv(3), A_out_total
+		
+		rho = ss%rho_ref
+		flux_in = 0.0d0
+		flux_out = 0.0d0
+		A_out_total = 0.0d0
+		
+		! 计算入口和出口总质量通量
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx < 1 .or. face_idx > ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1)
+				if (oc < 1 .or. oc > ss%nCells) cycle
+				fn = mesh%fAVecs(face_idx,:)
+				
+				select case(bcs(b)%type)
+				case(InletBoundary)
+					flux_in = flux_in + rho * dot_product(U_in, fn)
+				case(OutletBoundary)
+					fv = (/ss%u(oc), ss%v(oc), ss%w(oc)/)
+					flux_out = flux_out + rho * dot_product(fv, fn)
+					A_out_total = A_out_total + mag(fn)
+				end select
+			end do
+		end do
+		
+		! 如果出口通量不为零，按比例缩放出口单元速度
+		if (abs(flux_out) > 1.0d-20 .and. A_out_total > 1.0d-20) then
+			! flux_in（负值=流入） + flux_out（正值=流出）应=0
+			! 需要出口通量 = -flux_in，即缩放比 = -flux_in/flux_out
+			ratio = -flux_in / flux_out
+			if (ratio > 0.0d0 .and. ratio < 10.0d0) then
+				do b = 1, min(ss%nBoundaries, size(bcs))
+					if (bcs(b)%type /= OutletBoundary) cycle
+					do fi = 1, size(mesh%boundaryFaces, 2)
+						face_idx = mesh%boundaryFaces(b, fi)
+						if (face_idx == 0) exit
+						if (face_idx < 1 .or. face_idx > ss%nFaces) cycle
+						oc = mesh%faces(face_idx, 1)
+						if (oc < 1 .or. oc > ss%nCells) cycle
+						ss%u(oc) = ss%u(oc) * ratio
+						ss%v(oc) = ss%v(oc) * ratio
+						ss%w(oc) = ss%w(oc) * ratio
+					end do
+				end do
+			end if
+		end if
+	end subroutine simple_correct_mass_flux
 
 	subroutine simple_turbulence(mesh, ss, fluid)
 		implicit none
@@ -4825,6 +4914,46 @@ function triangleCentroid(points)
 		deallocate(prims, st%cellMuT, st%cellYplus)
 	end subroutine simple_writeVTK
 
+	subroutine simple_diagnose_boundary(mesh, ss, bcs, fluid, U_in)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(in) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		type(Fluidd), intent(in) :: fluid
+		real(kind=8), intent(in) :: U_in(3)
+		integer :: b, fi, face_idx, oc, nf
+		real(kind=8) :: fn(3), rho, flux_total, fv(3)
+		real(kind=8) :: A_sum(3)
+		
+		rho = ss%rho_ref
+		print *, '=== 边界面诊断 ==='
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			flux_total = 0.0d0
+			A_sum = 0.0d0
+			nf = 0
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx < 1 .or. face_idx > ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1)
+				if (oc < 1 .or. oc > ss%nCells) cycle
+				fn = mesh%fAVecs(face_idx,:)
+				A_sum = A_sum + fn
+				nf = nf + 1
+				select case(bcs(b)%type)
+				case(InletBoundary)
+					flux_total = flux_total + rho * dot_product(U_in, fn)
+				case(OutletBoundary)
+					fv = (/ss%u(oc), ss%v(oc), ss%w(oc)/)
+					flux_total = flux_total + rho * dot_product(fv, fn)
+				end select
+			end do
+			write(*,'(A,I2,A,I2,A,I6,A,3ES11.3,A,ES11.3)') &
+				'  BC ', b, ' type=', bcs(b)%type, ' nf=', nf, &
+				' A=', A_sum, ' flux=', flux_total
+		end do
+		print *, '=== end 诊断 ==='
+	end subroutine simple_diagnose_boundary
 
 !===============================================================================
 ! SECTION 13: TURKEL LOW-MACH PRECONDITIONING (for density-based solver)
