@@ -47,9 +47,9 @@ module BuFlowModule
     real(kind=8), parameter :: SIMPLE_ALPHA_P = 0.05d0
     real(kind=8), parameter :: SIMPLE_ALPHA_K = 0.5d0
     real(kind=8), parameter :: SIMPLE_ALPHA_OMEGA = 0.5d0
-    integer, parameter :: SIMPLE_MAX_ITER = 2000
-    integer, parameter :: SIMPLE_MAX_INNER_U = 3
-    integer, parameter :: SIMPLE_MAX_INNER_P = 50
+    integer, parameter :: SIMPLE_MAX_ITER = 500
+    integer, parameter :: SIMPLE_MAX_INNER_U = 5
+    integer, parameter :: SIMPLE_MAX_INNER_P = 80
     real(kind=8), parameter :: SIMPLE_TOLERANCE = 1.0d-6
     integer, parameter :: SIMPLE_OUTPUT_INTERVAL = 50
     !===========================================================================
@@ -3289,11 +3289,15 @@ function triangleCentroid(points)
             
             bNFacesLine = findInLines("nFaces", bLines, startLine)
             pos = index(bLines(bNFacesLine), "nFaces") + 6
-            read(bLines(bNFacesLine)(pos:), *) boundaryNumFaces(i)
+            lineStr = bLines(bNFacesLine)(pos:)
+            call removeSemicolon(lineStr)
+            read(lineStr, *) boundaryNumFaces(i)
             
             bStartFaceLine = findInLines("startFace", bLines, startLine)
             pos = index(bLines(bStartFaceLine), "startFace") + 9
-            read(bLines(bStartFaceLine), *) dummy, boundaryStartFaces(i)
+            lineStr = bLines(bStartFaceLine)
+            call removeSemicolon(lineStr)
+            read(lineStr, *) dummy, boundaryStartFaces(i)
 			boundaryStartFaces(i) = boundaryStartFaces(i) + 1
 			!boundaryEndFaces(i) = boundaryStartFaces(i) + boundaryNumFaces(i) - 1
             
@@ -3301,6 +3305,15 @@ function triangleCentroid(points)
         end do
         deallocate(bLines)
     end subroutine readOFBoundaryFile
+
+    ! 辅助函数：去除字符串中的分号（兼容OpenFOAM格式）
+    subroutine removeSemicolon(str)
+        character(len=*), intent(inout) :: str
+        integer :: i
+        do i = 1, len_trim(str)
+            if (str(i:i) == ';') str(i:i) = ' '
+        end do
+    end subroutine removeSemicolon
 
     ! 辅助函数：查找数据数量和起始行
     subroutine OFFile_FindNItems(fileLines, startLine, itemCount)
@@ -4254,7 +4267,7 @@ function triangleCentroid(points)
 		! Flow conditions
 		P = 100000.0d0
 		T = 300.0d0
-		U = [22.0d0, 22.0d0, 0.0d0]!U = [33.30d0, 0.7d0, 0.0d0]
+		U = [11.0d0, 0.0d0, 0.0d0]  ! 汽车常用速度 ~40 km/h
 		UunitVec = normalize(U)
 		a = sqrt(fluid%gammaa * fluid%R * T)
 		machNum = mag(U)/a
@@ -4380,7 +4393,7 @@ function triangleCentroid(points)
 		allocate(ss%rho_field(ss%nCells))
 		allocate(u_old(ss%nCells), v_old(ss%nCells), w_old(ss%nCells), p_old(ss%nCells))
 		
-		ss%p = P_init
+		ss%p = 0.0d0  ! 使用表压（gauge pressure），p_ref = P_init 作为参考压力
 		ss%u = U_init(1)
 		ss%v = U_init(2)
 		ss%w = U_init(3)
@@ -4420,7 +4433,7 @@ function triangleCentroid(points)
 			call simple_momentum_all(mesh, ss, boundaryConditions, fluid, U_init)
 			call simple_pressure_correct(mesh, ss, boundaryConditions, fluid, U_init)
 			
-			if (mod(iter, 10) == 0) then
+			if (mod(iter, 50) == 0 .and. iter > 100) then
 				call simple_turbulence(mesh, ss, fluid)
 			end if
 			
@@ -4430,9 +4443,10 @@ function triangleCentroid(points)
 			res_p = maxval(abs(ss%p - p_old)) / max(maxval(abs(ss%p)), 1.0d-10)
 			res_max = max(res_u, res_v, res_w, res_p)
 			
-			if (mod(iter, 10) == 0 .or. iter <= 5) then
-				write(*,'(A,I6,A,4ES12.4)') ' SIMPLE iter=', iter, &
-					'  res(u,v,w,p)=', res_u, res_v, res_w, res_p
+			if (mod(iter, 1) == 0 .and. iter <= 30 .or. mod(iter, 10) == 0) then
+				write(*,'(A,I6,A,4ES12.4,A,2ES12.4)') ' SIMPLE iter=', iter, &
+					'  res=', res_u, res_v, res_w, res_p, &
+					'  p=', minval(ss%p), maxval(ss%p)
 			end if
 			
 			if (mod(iter, SIMPLE_OUTPUT_INTERVAL) == 0) then
@@ -4457,7 +4471,8 @@ function triangleCentroid(points)
 		
 		print *, ''
 		print *, '=== SIMPLE Solution Summary ==='
-		print *, '  P range :', minval(ss%p), maxval(ss%p)
+		print *, '  P gauge :', minval(ss%p), maxval(ss%p)
+		print *, '  P abs   :', minval(ss%p)+ss%p_ref, maxval(ss%p)+ss%p_ref
 		print *, '  U range :', minval(ss%u), maxval(ss%u)
 		print *, '  V range :', minval(ss%v), maxval(ss%v)
 		print *, '  |V| max :', maxval(sqrt(ss%u**2 + ss%v**2 + ss%w**2))
@@ -4578,6 +4593,8 @@ function triangleCentroid(points)
 		end do
 		
 		do c = 1, ss%nCells
+			! 伪瞬态对角贡献（dt_pseudo 越小越稳定但收敛越慢）
+			aP(c) = aP(c) + rho * mesh%cVols(c) / 0.001d0
 			aP(c) = max(aP(c), 1.0d-10)
 		end do
 		ss%aP_u = aP / SIMPLE_ALPHA_U
@@ -4732,9 +4749,9 @@ function triangleCentroid(points)
 			ss%u(c) = ss%u(c) - D_c*gPp(c,1)
 			ss%v(c) = ss%v(c) - D_c*gPp(c,2)
 			ss%w(c) = ss%w(c) - D_c*gPp(c,3)
-			ss%u(c) = max(-500.0d0, min(500.0d0, ss%u(c)))
-			ss%v(c) = max(-500.0d0, min(500.0d0, ss%v(c)))
-			ss%w(c) = max(-500.0d0, min(500.0d0, ss%w(c)))
+			ss%u(c) = max(-100.0d0, min(100.0d0, ss%u(c)))
+			ss%v(c) = max(-100.0d0, min(100.0d0, ss%v(c)))
+			ss%w(c) = max(-100.0d0, min(100.0d0, ss%w(c)))
 		end do
 		
 		deallocate(gP, gPp)
@@ -4796,7 +4813,8 @@ function triangleCentroid(points)
 		character(len=256) :: vn
 		
 		allocate(prims(ss%nCells, 7))
-		prims(:,1)=ss%p; prims(:,2)=ss%p/(fluid%R*ss%rho_ref)
+		prims(:,1)=ss%p + ss%p_ref  ! 输出绝对压力（表压+参考压力）
+		prims(:,2)=(ss%p + ss%p_ref)/(fluid%R*ss%rho_ref)
 		prims(:,3)=ss%u; prims(:,4)=ss%v; prims(:,5)=ss%w
 		prims(:,6)=ss%k; prims(:,7)=ss%omega
 		allocate(st%cellMuT(ss%nCells), st%cellYplus(ss%nCells))
