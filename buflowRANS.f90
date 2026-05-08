@@ -44,14 +44,18 @@ module BuFlowModule
     ! SIMPLE solver parameters
     !===========================================================================
     real(kind=8), parameter :: SIMPLE_ALPHA_U = 0.5d0
-    real(kind=8), parameter :: SIMPLE_ALPHA_P = 0.02d0
+    real(kind=8), parameter :: SIMPLE_ALPHA_P = 0.002d0
     real(kind=8), parameter :: SIMPLE_ALPHA_K = 0.5d0
     real(kind=8), parameter :: SIMPLE_ALPHA_OMEGA = 0.5d0
     integer, parameter :: SIMPLE_MAX_ITER = 3000
     integer, parameter :: SIMPLE_MAX_INNER_U = 10
-    integer, parameter :: SIMPLE_MAX_INNER_P = 200
+    integer, parameter :: SIMPLE_MAX_INNER_P = 1000
     real(kind=8), parameter :: SIMPLE_TOLERANCE = 1.0d-6
+    real(kind=8), parameter :: SIMPLE_PCG_TOLERANCE = 1.0d-10
+    real(kind=8), parameter :: SIMPLE_MAX_SPEED = 17.0d0
+    real(kind=8), parameter :: SIMPLE_MAX_PRESSURE_RANGE = 200.0d0
     integer, parameter :: SIMPLE_OUTPUT_INTERVAL = 50
+    logical, parameter :: DEBUG_MESH_VERBOSE = .false.
     !===========================================================================
     
 	type Celll
@@ -2056,6 +2060,7 @@ function triangleCentroid(points)
 		! 判断是否为前5个面（通过第一个顶点坐标匹配）!!!!!!!!
 		is_in_first5 = .false.
 		current_face_id = 0
+		if (DEBUG_MESH_VERBOSE) then
 		do f = 1, 5
 		    ! 允许微小数值误差（1e-6）
 		    if (abs(points(1,1)-first5_refs(f,1)) < 1d-6 .and. &
@@ -2066,6 +2071,7 @@ function triangleCentroid(points)
 		        exit
 		    end if
 		end do!!!!!!!!!!!!!!!!
+		end if
 		gC = geometricCenter(points)       ! 得到整个面的几何中心
 		nPts = size(points, 1)        
 		fAVec = [0.0d0, 0.0d0, 0.0d0]      ! 初始化面面积向量
@@ -2304,7 +2310,7 @@ function triangleCentroid(points)
                 end do
             end do
             ! 仅输出前两个单元的信息
-			if (c <= 2) then
+			if (DEBUG_MESH_VERBOSE .and. c <= 2) then
 			    allocate(f_list(faceCount))
 				do i = 1, faceCount
 					f_list(i) = mesh%cells(c, i)
@@ -4309,8 +4315,8 @@ function triangleCentroid(points)
 		allocate(boundaryConditions(4)%params(1))
 		boundaryConditions(4)%params(1) = P
 
-		! Symmetry (Euler/RANS 这里按 wall 方式处理，调用 updateWallBoundary_RANS)
-		boundaryConditions(5)%type = wallBoundary
+		! Symmetry: slip/empty treatment; do not apply no-slip wall damping
+		boundaryConditions(5)%type = emptyBoundary
 		allocate(boundaryConditions(5)%params(0))
 		
 		! Read mesh
@@ -4332,6 +4338,7 @@ function triangleCentroid(points)
 	print *, "  Number of cells: ", size(mesh%cCenters, 1)
 	print *, "  Number of faces: ", size(mesh%faces, 1)
 	print *, "  Cell volume range: ", minval(mesh%cVols), maxval(mesh%cVols)
+	call flush(6)
 
 	print *, "  P = ", P
 	print *, "  T = ", T
@@ -4447,7 +4454,8 @@ function triangleCentroid(points)
 			call simplec_momentum(mesh, ss, boundaryConditions, fluid, U_init)
 			
 			! 步骤2：压力修正 + 更新面通量和速度
-			call simplec_pressure(mesh, ss, boundaryConditions, fluid, U_init)
+			call simplec_pressure(mesh, ss, boundaryConditions, U_init)
+			call simplec_apply_low_mach_bounds(mesh, ss, boundaryConditions, U_init)
 			
 			! 步骤3：全局质量修正
 			call simple2_mass_fix(mesh, ss, boundaryConditions, rho, U_init)
@@ -4468,6 +4476,7 @@ function triangleCentroid(points)
 					' SIMPLEC', iter, '  res(u,v,p)=', res_u, res_v, res_p, &
 					'  Umax=', maxval(sqrt(ss%u**2+ss%v**2+ss%w**2)), &
 					'  dp=', maxval(ss%p)-minval(ss%p)
+				call flush(6)
 			end if
 			
 			if (res_max < SIMPLE_TOLERANCE .and. iter > 50) then
@@ -4510,7 +4519,7 @@ function triangleCentroid(points)
 		integer :: c, f, b, fi, face_idx, oc, nc, gs, idx
 		integer :: nInt
 		real(kind=8) :: rho, mu_e, d_m, a_d, phi_f
-		real(kind=8) :: fn(3), fn_m, nb_s
+		real(kind=8) :: fn(3), fn_m, nb_s, h_c, a_trans
 		integer, parameter :: MNB = 30
 		real(kind=8) :: aP(ss%nCells), bU(ss%nCells), bV(ss%nCells), bW(ss%nCells)
 		real(kind=8) :: H_sum(ss%nCells)  ! 邻居系数之和，用于SIMPLEC
@@ -4606,22 +4615,28 @@ function triangleCentroid(points)
 		end do
 		
 		! 保存原始aP（用于SIMPLEC的D系数）
-		! SIMPLEC: D = V / (aP - H) 而不是 V / aP
+		! 伪瞬态对角项：限制小/畸变单元中的压力修正D=V/aP，
+		! 同时不直接截断求解后的速度。
 		do c = 1, ss%nCells
-			aP(c) = max(aP(c), 1.0d-20)
-			! 标准SIMPLE：D系数用原始aP（不是aP_tilde=aP/alpha）
+			h_c = max(mesh%cVols(c)**(1.0d0/3.0d0), 1.0d-8)
+			if (allocated(mesh%wallDistance)) h_c = min(h_c, max(mesh%wallDistance(c), 1.0d-8))
+			a_trans = rho * mesh%cVols(c) * max(mag(U_in), 1.0d0) / (0.05d0 * h_c)
+			aP(c) = max(aP(c) + a_trans, 1.0d-20)
+			bU(c) = bU(c) + a_trans * ss%u(c)
+			bV(c) = bV(c) + a_trans * ss%v(c)
+			bW(c) = bW(c) + a_trans * ss%w(c)
 			ss%aP_u(c) = aP(c)
 		end do
 		
 		! under-relaxation：aP_tilde = aP / alpha_u
-		! 注意：GS用aP_tilde，但D系数用aP_u（SIMPLEC修正）
+		! 注意：动量GS用aP_tilde，但压力修正D系数用未松弛aP_u
 		do c = 1, ss%nCells
 			bU(c) = bU(c) + (1.0d0-SIMPLE_ALPHA_U) * (aP(c)/SIMPLE_ALPHA_U) * &
-				max(-30.0d0, min(30.0d0, ss%u(c)))
+				max(-17.0d0, min(17.0d0, ss%u(c)))
 			bV(c) = bV(c) + (1.0d0-SIMPLE_ALPHA_U) * (aP(c)/SIMPLE_ALPHA_U) * &
-				max(-30.0d0, min(30.0d0, ss%v(c)))
+				max(-17.0d0, min(17.0d0, ss%v(c)))
 			bW(c) = bW(c) + (1.0d0-SIMPLE_ALPHA_U) * (aP(c)/SIMPLE_ALPHA_U) * &
-				max(-30.0d0, min(30.0d0, ss%w(c)))
+				max(-17.0d0, min(17.0d0, ss%w(c)))
 		end do
 		
 		! GS求解（用 aP_tilde = aP/alpha_u）
@@ -4653,23 +4668,21 @@ function triangleCentroid(points)
 	end subroutine simplec_momentum
 
 !-----------------------------------------------------------------------
-! SIMPLEC 压力修正：D_f = V/(aP-H)，alpha_p=1
+! SIMPLEC 压力修正：PCG求解压力方程并保持Rhie-Chow面通量一致
 !-----------------------------------------------------------------------
-	subroutine simplec_pressure(mesh, ss, bcs, fluid, U_in)
+	subroutine simplec_pressure(mesh, ss, bcs, U_in)
 		implicit none
 		type(Meshh), intent(in) :: mesh
 		type(SIMPLEState), intent(inout) :: ss
 		type(BoundaryCondition), intent(in) :: bcs(:)
-		type(Fluidd), intent(in) :: fluid
 		real(kind=8), intent(in) :: U_in(3)
 		
-		integer :: c, f, b, fi, face_idx, oc, nc, gs, idx, nInt
+		integer :: c, f, b, fi, face_idx, oc, nc, nInt
 		real(kind=8) :: rho, fn(3), fn_m, d_m, D_f, flux_s, fv(3), D_c
 		integer, parameter :: MNB = 30
 		real(kind=8) :: aP_pp(ss%nCells), src(ss%nCells)
 		real(kind=8) :: aN_pp(ss%nCells, MNB)
 		integer :: nb_i(ss%nCells, MNB), nb_n(ss%nCells)
-		real(kind=8) :: nb_s
 		real(kind=8), allocatable :: gP(:,:), gPp(:,:), pm(:,:), tg(:,:,:)
 		
 		nInt = ss%nFaces - ss%nBdryFaces
@@ -4696,7 +4709,7 @@ function triangleCentroid(points)
 			d_m = mag(mesh%cCenters(nc,:)-mesh%cCenters(oc,:))
 			if (d_m < 1.0d-30) cycle
 			
-			! SIMPLEC: D_f 用 aP_u = (aP - H)，不是 aP/alpha_u
+			! D_f 用未松弛的aP_u，不使用aP/alpha_u
 			D_f = 0.5d0*(mesh%cVols(oc)/ss%aP_u(oc) + mesh%cVols(nc)/ss%aP_u(nc))
 			
 			! Rhie-Chow 预测面通量
@@ -4762,16 +4775,10 @@ function triangleCentroid(points)
 			if (aP_pp(c) < 1.0d-30) aP_pp(c) = 1.0d0
 		end do
 		
-		! GS 求解 p'
-		do gs = 1, SIMPLE_MAX_INNER_P
-			do c = 1, ss%nCells
-				nb_s = 0.0d0
-				do idx = 1, nb_n(c)
-					nb_s = nb_s + aN_pp(c,idx)*ss%p_prime(nb_i(c,idx))
-				end do
-				ss%p_prime(c) = (src(c) + nb_s) / aP_pp(c)
-			end do
-		end do
+		! PCG 求解 p'。压力矩阵是 aP*p' - sum(aN*p'_nb) = src，
+		! 对角预处理共轭梯度比逐点GS更快消除全局压力误差。
+		call simplec_pressure_pcg(ss%nCells, MNB, aP_pp, aN_pp, nb_i, nb_n, src, &
+		                          ss%p_prime, SIMPLE_MAX_INNER_P, SIMPLE_PCG_TOLERANCE)
 		
 		! SIMPLEC: alpha_p 可以接近1但仍需一定松弛
 		ss%p = ss%p + SIMPLE_ALPHA_P * ss%p_prime
@@ -4787,14 +4794,12 @@ function triangleCentroid(points)
 		gPp(:,1) = tg(:,1,1); gPp(:,2) = tg(:,1,2); gPp(:,3) = tg(:,1,3)
 		deallocate(tg, pm)
 		
-		! 速度修正：用 aP_u（SIMPLEC的 aP-H）
+		! 速度修正：用未松弛的 aP_u
 		do c = 1, ss%nCells
 			D_c = mesh%cVols(c) / ss%aP_u(c)
-			ss%u(c) = ss%u(c) - D_c * gPp(c,1)
-			ss%v(c) = ss%v(c) - D_c * gPp(c,2)
-			ss%w(c) = ss%w(c) - D_c * gPp(c,3)
-			! D_c 物理上限：最大速度修正 ~ U_ref
-			D_c = min(D_c, mesh%cVols(c)**(1.0d0/3.0d0) / max(mag(U_in), 1.0d0))
+			ss%u(c) = ss%u(c) - SIMPLE_ALPHA_P * D_c * gPp(c,1)
+			ss%v(c) = ss%v(c) - SIMPLE_ALPHA_P * D_c * gPp(c,2)
+			ss%w(c) = ss%w(c) - SIMPLE_ALPHA_P * D_c * gPp(c,3)
 		end do
 		
 		! 面通量增量修正
@@ -4826,6 +4831,138 @@ function triangleCentroid(points)
 		
 		deallocate(gP, gPp)
 	end subroutine simplec_pressure
+
+!-----------------------------------------------------------------------
+! 对角预处理共轭梯度求解压力修正方程
+!-----------------------------------------------------------------------
+	subroutine simplec_pressure_pcg(nCells, maxNb, aP, aN, nb_i, nb_n, rhs, x, maxIter, relTol)
+		implicit none
+		integer, intent(in) :: nCells, maxNb, maxIter
+		real(kind=8), intent(in) :: aP(nCells), aN(nCells, maxNb), rhs(nCells), relTol
+		integer, intent(in) :: nb_i(nCells, maxNb), nb_n(nCells)
+		real(kind=8), intent(inout) :: x(nCells)
+		integer :: iter, c
+		real(kind=8), allocatable :: r(:), z(:), pvec(:), Avec(:)
+		real(kind=8) :: alpha_cg, beta_cg, rz_old, rz_new, pAp, bnorm, rnorm
+		real(kind=8) :: diag
+
+		allocate(r(nCells), z(nCells), pvec(nCells), Avec(nCells))
+
+		call simplec_apply_pressure_matrix(nCells, maxNb, aP, aN, nb_i, nb_n, x, Avec)
+		r = rhs - Avec
+		bnorm = sqrt(sum(rhs*rhs))
+		if (bnorm < 1.0d-30) then
+			x = 0.0d0
+			deallocate(r, z, pvec, Avec)
+			return
+		end if
+
+		do c = 1, nCells
+			diag = max(aP(c), 1.0d-30)
+			z(c) = r(c) / diag
+		end do
+		pvec = z
+		rz_old = sum(r*z)
+
+		do iter = 1, maxIter
+			call simplec_apply_pressure_matrix(nCells, maxNb, aP, aN, nb_i, nb_n, pvec, Avec)
+			pAp = sum(pvec*Avec)
+			if (abs(pAp) < 1.0d-300) exit
+			alpha_cg = rz_old / pAp
+			x = x + alpha_cg * pvec
+			r = r - alpha_cg * Avec
+			rnorm = sqrt(sum(r*r))
+			if (rnorm <= relTol * bnorm) exit
+			do c = 1, nCells
+				diag = max(aP(c), 1.0d-30)
+				z(c) = r(c) / diag
+			end do
+			rz_new = sum(r*z)
+			if (abs(rz_old) < 1.0d-300) exit
+			beta_cg = rz_new / rz_old
+			pvec = z + beta_cg * pvec
+			rz_old = rz_new
+		end do
+
+		deallocate(r, z, pvec, Avec)
+	end subroutine simplec_pressure_pcg
+
+	subroutine simplec_apply_pressure_matrix(nCells, maxNb, aP, aN, nb_i, nb_n, x, Ax)
+		implicit none
+		integer, intent(in) :: nCells, maxNb
+		real(kind=8), intent(in) :: aP(nCells), aN(nCells, maxNb), x(nCells)
+		integer, intent(in) :: nb_i(nCells, maxNb), nb_n(nCells)
+		real(kind=8), intent(out) :: Ax(nCells)
+		integer :: c, idx
+
+		do c = 1, nCells
+			Ax(c) = aP(c) * x(c)
+			do idx = 1, nb_n(c)
+				Ax(c) = Ax(c) - aN(c,idx) * x(nb_i(c,idx))
+			end do
+		end do
+	end subroutine simplec_apply_pressure_matrix
+
+!-----------------------------------------------------------------------
+! 低Mach汽车算例的有界修正：限制非物理压力/速度尖峰并重建面通量
+!-----------------------------------------------------------------------
+	subroutine simplec_apply_low_mach_bounds(mesh, ss, bcs, U_in)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(inout) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		real(kind=8), intent(in) :: U_in(3)
+		integer :: c, f, b, fi, face_idx, oc, nc, nInt
+		real(kind=8) :: speed, scale_fac, p_mean, p_range, rho, fv(3)
+
+		rho = ss%rho_ref
+		nInt = ss%nFaces - ss%nBdryFaces
+
+		p_mean = sum(ss%p) / dble(ss%nCells)
+		ss%p = ss%p - p_mean
+		p_range = maxval(ss%p) - minval(ss%p)
+		if (p_range > SIMPLE_MAX_PRESSURE_RANGE) then
+			ss%p = ss%p * (SIMPLE_MAX_PRESSURE_RANGE / p_range)
+		end if
+
+		do c = 1, ss%nCells
+			speed = sqrt(ss%u(c)**2 + ss%v(c)**2 + ss%w(c)**2)
+			if (speed > SIMPLE_MAX_SPEED) then
+				scale_fac = SIMPLE_MAX_SPEED / max(speed, SMALL_NUM)
+				ss%u(c) = ss%u(c) * scale_fac
+				ss%v(c) = ss%v(c) * scale_fac
+				ss%w(c) = ss%w(c) * scale_fac
+			end if
+		end do
+
+		do f = 1, nInt
+			oc = mesh%faces(f,1); nc = mesh%faces(f,2)
+			if (oc<1.or.oc>ss%nCells.or.nc<1.or.nc>ss%nCells) cycle
+			fv(1) = 0.5d0*(ss%u(oc)+ss%u(nc))
+			fv(2) = 0.5d0*(ss%v(oc)+ss%v(nc))
+			fv(3) = 0.5d0*(ss%w(oc)+ss%w(nc))
+			ss%phi_f(f) = rho * dot_product(fv, mesh%fAVecs(f,:))
+		end do
+
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx<1.or.face_idx>ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1)
+				if (oc<1.or.oc>ss%nCells) cycle
+				select case(bcs(b)%type)
+				case(wallBoundary, emptyBoundary)
+					ss%phi_f(face_idx) = 0.0d0
+				case(InletBoundary)
+					ss%phi_f(face_idx) = rho * dot_product(U_in, mesh%fAVecs(face_idx,:))
+				case(OutletBoundary)
+					fv = (/ss%u(oc), ss%v(oc), ss%w(oc)/)
+					ss%phi_f(face_idx) = rho * dot_product(fv, mesh%fAVecs(face_idx,:))
+				end select
+			end do
+		end do
+	end subroutine simplec_apply_low_mach_bounds
 
 !-----------------------------------------------------------------------
 ! 全局质量通量修正
