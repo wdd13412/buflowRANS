@@ -4318,8 +4318,8 @@ function triangleCentroid(points)
 		allocate(boundaryConditions(4)%params(1))
 		boundaryConditions(4)%params(1) = P
 
-		! Symmetry: slip/empty treatment; do not apply no-slip wall damping
-		boundaryConditions(5)%type = emptyBoundary
+		! Symmetry (Euler/RANS density solver historically treats this as wall)
+		boundaryConditions(5)%type = wallBoundary
 		allocate(boundaryConditions(5)%params(0))
 		
 		! Read mesh
@@ -4349,11 +4349,10 @@ function triangleCentroid(points)
 	print *, "  k_init = ", k_init
 	print *, "  omega_init = ", omega_init
 
-	call configureBoundaryConditionsFromMesh(mesh, boundaryConditions, P, Pt, Tt, &
-	                                     UunitVec, k_init, omega_init)
-
 		! Dispatch to selected solver
 		if (SOLVER_TYPE == SOLVER_SIMPLE) then
+			call configureBoundaryConditionsFromMesh(mesh, boundaryConditions, P, Pt, Tt, &
+			                                     UunitVec, k_init, omega_init)
 			print *, ''
 			print *, '>>> Using SIMPLE pressure-based solver (low Mach) <<<'
 			call solve_SIMPLE(mesh, meshPath, boundaryConditions, fluid, &
