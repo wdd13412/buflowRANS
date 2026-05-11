@@ -97,6 +97,7 @@ module BuFlowModule
 		real(kind=8), allocatable :: fAVecs(:,:)
 		real(kind=8), allocatable :: fCenters(:,:)
 		integer(kind=8), allocatable :: boundaryFaces(:,:)
+		character(len=100), allocatable :: boundaryNames(:)
 		
 		!--- RANS k-omega: Added wall distance field ---
 		real(kind=8), allocatable :: wallDistance(:)     ! Distance from cell center to nearest wall
@@ -2225,6 +2226,8 @@ function triangleCentroid(points)
         nFaces = size(tempMesh%owner)
         nCells = maxval(tempMesh%owner)
         nBoundaries = size(tempMesh%boundaryNames)     
+        allocate(mesh%boundaryNames(nBoundaries))
+        mesh%boundaryNames = tempMesh%boundaryNames
         allocate(mesh%faces(nFaces, 2))
         allocate(mesh%fAVecs(nFaces, 3), mesh%fCenters(nFaces, 3))
         
@@ -4346,6 +4349,9 @@ function triangleCentroid(points)
 	print *, "  k_init = ", k_init
 	print *, "  omega_init = ", omega_init
 
+	call configureBoundaryConditionsFromMesh(mesh, boundaryConditions, P, Pt, Tt, &
+	                                     UunitVec, k_init, omega_init)
+
 		! Dispatch to selected solver
 		if (SOLVER_TYPE == SOLVER_SIMPLE) then
 			print *, ''
@@ -4359,13 +4365,79 @@ function triangleCentroid(points)
 			call solve(mesh, meshPath, cellPrimitives, boundaryConditions)
 		end if
 		
-		if (allocated(boundaryConditions)) deallocate(boundaryConditions)
+		if (allocated(boundaryConditions)) call freeBoundaryConditions(boundaryConditions)
 	end subroutine compute_CFD_RANS
 
 
 !===============================================================================
 
 !===============================================================================
+
+!-----------------------------------------------------------------------
+! 根据 OpenFOAM boundary 名称配置边界条件，避免 SIMPLEC 依赖硬编码顺序
+!-----------------------------------------------------------------------
+	subroutine configureBoundaryConditionsFromMesh(mesh, boundaryConditions, P, Pt, Tt, &
+	                                             UunitVec, k_init, omega_init)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(BoundaryCondition), allocatable, intent(inout) :: boundaryConditions(:)
+		real(kind=8), intent(in) :: P, Pt, Tt, UunitVec(3), k_init, omega_init
+		integer :: b, nBoundaries
+		character(len=100) :: bname
+
+		if (.not. allocated(mesh%boundaryNames)) return
+		nBoundaries = size(mesh%boundaryNames)
+		if (allocated(boundaryConditions)) call freeBoundaryConditions(boundaryConditions)
+		allocate(boundaryConditions(nBoundaries))
+
+		print *, 'Boundary condition mapping from OpenFOAM boundary names:'
+		do b = 1, nBoundaries
+			bname = trim(adjustl(mesh%boundaryNames(b)))
+			do while (len_trim(bname) > 0 .and. iachar(bname(1:1)) == 9)
+				bname = trim(adjustl(bname(2:)))
+			end do
+			select case (trim(bname))
+			case ('airfoil', 'car', 'wall', 'walls', 'body')
+				boundaryConditions(b)%type = wallBoundary
+				allocate(boundaryConditions(b)%params(0))
+				print *, '  ', trim(bname), ' -> wall'
+			case ('empty', 'frontAndBack')
+				boundaryConditions(b)%type = emptyBoundary
+				allocate(boundaryConditions(b)%params(0))
+				print *, '  ', trim(bname), ' -> empty/slip'
+			case ('symmetry', 'symmetryPlane')
+				boundaryConditions(b)%type = emptyBoundary
+				allocate(boundaryConditions(b)%params(0))
+				print *, '  ', trim(bname), ' -> symmetry/slip'
+			case ('inlet', 'Inlet')
+				boundaryConditions(b)%type = InletBoundary
+				allocate(boundaryConditions(b)%params(6))
+				boundaryConditions(b)%params = [Pt, Tt, UunitVec(1), UunitVec(2), k_init, omega_init]
+				print *, '  ', trim(bname), ' -> inlet'
+			case ('outlet', 'Outlet')
+				boundaryConditions(b)%type = OutletBoundary
+				allocate(boundaryConditions(b)%params(1))
+				boundaryConditions(b)%params(1) = P
+				print *, '  ', trim(bname), ' -> outlet'
+			case default
+				boundaryConditions(b)%type = wallBoundary
+				allocate(boundaryConditions(b)%params(0))
+				print *, '  ', trim(bname), ' -> wall (default)'
+			end select
+		end do
+		call flush(6)
+	end subroutine configureBoundaryConditionsFromMesh
+
+	subroutine freeBoundaryConditions(boundaryConditions)
+		implicit none
+		type(BoundaryCondition), allocatable, intent(inout) :: boundaryConditions(:)
+		integer :: b
+		if (.not. allocated(boundaryConditions)) return
+		do b = 1, size(boundaryConditions)
+			if (allocated(boundaryConditions(b)%params)) deallocate(boundaryConditions(b)%params)
+		end do
+		deallocate(boundaryConditions)
+	end subroutine freeBoundaryConditions
 
 !===============================================================================
 ! SECTION 12: SIMPLEC 压力基求解器（修正D系数 + 面通量版）
@@ -4600,7 +4672,9 @@ function triangleCentroid(points)
 					aP(oc) = aP(oc) + a_d
 				case(InletBoundary)
 					phi_f = ss%phi_f(face_idx)
-					a_d = mu_e * fn_m / d_m + max(phi_f, 0.0d0)
+					! Fixed-value inlet: include incoming convective flux in the
+					! known-value source instead of treating the inlet as weak diffusion only.
+					a_d = mu_e * fn_m / d_m + max(-phi_f, 0.0d0)
 					aP(oc) = aP(oc) + a_d
 					bU(oc) = bU(oc) + a_d * U_in(1)
 					bV(oc) = bV(oc) + a_d * U_in(2)
