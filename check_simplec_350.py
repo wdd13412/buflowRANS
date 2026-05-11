@@ -3,8 +3,9 @@
 
 The car mesh is large enough that running all 3000 SIMPLEC iterations can be slow.
 This helper streams solver output, stops as soon as the requested iteration line is
-seen, and checks that the reported max speed and pressure range match the expected
-low-Mach car bounds.
+seen, and can optionally check reported max speed and pressure range against
+user-provided bounds. By default it only checks that the solver reaches the
+target iteration without NaN/ERROR output.
 """
 
 from __future__ import annotations
@@ -29,8 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exe", default="./buflow_run", help="solver executable to run")
     parser.add_argument("--target-iter", type=int, default=350, help="iteration to verify")
     parser.add_argument("--timeout", type=float, default=420.0, help="wall-clock timeout in seconds")
-    parser.add_argument("--expected-umax", type=float, default=17.0, help="expected Umax at target")
-    parser.add_argument("--expected-dp", type=float, default=200.0, help="expected pressure range at target")
+    parser.add_argument("--expected-umax", type=float, default=None, help="optional expected Umax at target")
+    parser.add_argument("--expected-dp", type=float, default=None, help="optional expected pressure range at target")
     parser.add_argument("--umax-tol", type=float, default=0.05, help="absolute Umax tolerance")
     parser.add_argument("--dp-tol", type=float, default=0.05, help="absolute pressure-range tolerance")
     return parser.parse_args()
@@ -114,19 +115,26 @@ def main() -> int:
                 return 1
 
             if last_iter >= args.target_iter:
-                umax_ok = abs(last_umax - args.expected_umax) <= args.umax_tol
-                dp_ok = abs(last_dp - args.expected_dp) <= args.dp_tol
                 stop_process(proc)
-                if umax_ok and dp_ok:
-                    print(
-                        f"PASS: SIMPLEC {last_iter} reached target bounds: "
-                        f"Umax={last_umax:.3f}, dp={last_dp:.3f}"
-                    )
+                checks_ok = True
+                messages = []
+                if args.expected_umax is not None:
+                    umax_ok = abs(last_umax - args.expected_umax) <= args.umax_tol
+                    checks_ok = checks_ok and umax_ok
+                    messages.append(f"Umax={last_umax:.3f} expected {args.expected_umax}±{args.umax_tol}")
+                else:
+                    messages.append(f"Umax={last_umax:.3f}")
+                if args.expected_dp is not None:
+                    dp_ok = abs(last_dp - args.expected_dp) <= args.dp_tol
+                    checks_ok = checks_ok and dp_ok
+                    messages.append(f"dp={last_dp:.3f} expected {args.expected_dp}±{args.dp_tol}")
+                else:
+                    messages.append(f"dp={last_dp:.3f}")
+                if checks_ok:
+                    print(f"PASS: SIMPLEC {last_iter} reached target iteration: " + ", ".join(messages))
                     return 0
                 print(
-                    f"ERROR: SIMPLEC {last_iter} outside target bounds: "
-                    f"Umax={last_umax:.6g} expected {args.expected_umax}±{args.umax_tol}, "
-                    f"dp={last_dp:.6g} expected {args.expected_dp}±{args.dp_tol}",
+                    f"ERROR: SIMPLEC {last_iter} outside requested bounds: " + ", ".join(messages),
                     file=sys.stderr,
                 )
                 return 1

@@ -4526,7 +4526,6 @@ function triangleCentroid(points)
 			
 			! 步骤2：压力修正 + 更新面通量和速度
 			call simplec_pressure(mesh, ss, boundaryConditions, U_init)
-			call simplec_apply_low_mach_bounds(mesh, ss, boundaryConditions, U_init)
 			
 			! 步骤3：全局质量修正
 			call simple2_mass_fix(mesh, ss, boundaryConditions, rho, U_init)
@@ -4706,14 +4705,11 @@ function triangleCentroid(points)
 		end do
 		
 		! under-relaxation：aP_tilde = aP / alpha_u
-		! 注意：动量GS用aP_tilde，但压力修正D系数用未松弛aP_u
+		! 注意：这里不再截断历史速度，避免用人为限幅污染物理解。
 		do c = 1, ss%nCells
-			bU(c) = bU(c) + (1.0d0-SIMPLE_ALPHA_U) * (aP(c)/SIMPLE_ALPHA_U) * &
-				max(-17.0d0, min(17.0d0, ss%u(c)))
-			bV(c) = bV(c) + (1.0d0-SIMPLE_ALPHA_U) * (aP(c)/SIMPLE_ALPHA_U) * &
-				max(-17.0d0, min(17.0d0, ss%v(c)))
-			bW(c) = bW(c) + (1.0d0-SIMPLE_ALPHA_U) * (aP(c)/SIMPLE_ALPHA_U) * &
-				max(-17.0d0, min(17.0d0, ss%w(c)))
+			bU(c) = bU(c) + (1.0d0-SIMPLE_ALPHA_U) * (aP(c)/SIMPLE_ALPHA_U) * ss%u(c)
+			bV(c) = bV(c) + (1.0d0-SIMPLE_ALPHA_U) * (aP(c)/SIMPLE_ALPHA_U) * ss%v(c)
+			bW(c) = bW(c) + (1.0d0-SIMPLE_ALPHA_U) * (aP(c)/SIMPLE_ALPHA_U) * ss%w(c)
 		end do
 		
 		! GS求解（用 aP_tilde = aP/alpha_u）
@@ -4985,67 +4981,6 @@ function triangleCentroid(points)
 	end subroutine simplec_apply_pressure_matrix
 
 !-----------------------------------------------------------------------
-! 低Mach汽车算例的有界修正：限制非物理压力/速度尖峰并重建面通量
-!-----------------------------------------------------------------------
-	subroutine simplec_apply_low_mach_bounds(mesh, ss, bcs, U_in)
-		implicit none
-		type(Meshh), intent(in) :: mesh
-		type(SIMPLEState), intent(inout) :: ss
-		type(BoundaryCondition), intent(in) :: bcs(:)
-		real(kind=8), intent(in) :: U_in(3)
-		integer :: c, f, b, fi, face_idx, oc, nc, nInt
-		real(kind=8) :: speed, scale_fac, p_mean, p_range, rho, fv(3)
-
-		rho = ss%rho_ref
-		nInt = ss%nFaces - ss%nBdryFaces
-
-		p_mean = sum(ss%p) / dble(ss%nCells)
-		ss%p = ss%p - p_mean
-		p_range = maxval(ss%p) - minval(ss%p)
-		if (p_range > SIMPLE_MAX_PRESSURE_RANGE) then
-			ss%p = ss%p * (SIMPLE_MAX_PRESSURE_RANGE / p_range)
-		end if
-
-		do c = 1, ss%nCells
-			speed = sqrt(ss%u(c)**2 + ss%v(c)**2 + ss%w(c)**2)
-			if (speed > SIMPLE_MAX_SPEED) then
-				scale_fac = SIMPLE_MAX_SPEED / max(speed, SMALL_NUM)
-				ss%u(c) = ss%u(c) * scale_fac
-				ss%v(c) = ss%v(c) * scale_fac
-				ss%w(c) = ss%w(c) * scale_fac
-			end if
-		end do
-
-		do f = 1, nInt
-			oc = mesh%faces(f,1); nc = mesh%faces(f,2)
-			if (oc<1.or.oc>ss%nCells.or.nc<1.or.nc>ss%nCells) cycle
-			fv(1) = 0.5d0*(ss%u(oc)+ss%u(nc))
-			fv(2) = 0.5d0*(ss%v(oc)+ss%v(nc))
-			fv(3) = 0.5d0*(ss%w(oc)+ss%w(nc))
-			ss%phi_f(f) = rho * dot_product(fv, mesh%fAVecs(f,:))
-		end do
-
-		do b = 1, min(ss%nBoundaries, size(bcs))
-			do fi = 1, size(mesh%boundaryFaces, 2)
-				face_idx = mesh%boundaryFaces(b, fi)
-				if (face_idx == 0) exit
-				if (face_idx<1.or.face_idx>ss%nFaces) cycle
-				oc = mesh%faces(face_idx, 1)
-				if (oc<1.or.oc>ss%nCells) cycle
-				select case(bcs(b)%type)
-				case(wallBoundary, emptyBoundary)
-					ss%phi_f(face_idx) = 0.0d0
-				case(InletBoundary)
-					ss%phi_f(face_idx) = rho * dot_product(U_in, mesh%fAVecs(face_idx,:))
-				case(OutletBoundary)
-					fv = (/ss%u(oc), ss%v(oc), ss%w(oc)/)
-					ss%phi_f(face_idx) = rho * dot_product(fv, mesh%fAVecs(face_idx,:))
-				end select
-			end do
-		end do
-	end subroutine simplec_apply_low_mach_bounds
-
-!-----------------------------------------------------------------------
 ! SIMPLEC 诊断：定位压力/速度极值和各边界状态，避免只看全局极值
 !-----------------------------------------------------------------------
 	subroutine simplec_report_diagnostics(mesh, ss, bcs, iter)
@@ -5055,7 +4990,7 @@ function triangleCentroid(points)
 		type(BoundaryCondition), intent(in) :: bcs(:)
 		integer, intent(in) :: iter
 		integer :: c, b, fi, face_idx, oc, pmin_cell, pmax_cell, umax_cell, nFacesB
-		real(kind=8) :: speed, pmin_val, pmax_val, umax_val
+		real(kind=8) :: speed, pmin_val, pmax_val, umax_val, p_range
 		real(kind=8) :: b_pmin, b_pmax, b_psum, b_umax, b_flux
 		character(len=100) :: bname
 
@@ -5075,10 +5010,15 @@ function triangleCentroid(points)
 			end if
 		end do
 
-		write(*,'(A,I6,A,I8,A,3F10.4,A,I8,A,3F10.4,A,I8,A,F10.4)') &
+		p_range = pmax_val - pmin_val
+		write(*,'(A,I6,A,I8,A,3F10.4,A,I8,A,3F10.4,A,I8,A,F10.4,A,ES11.3)') &
 			'  diag', iter, ' pMinCell=', pmin_cell, ' xyz=', mesh%cCenters(pmin_cell,:), &
 			' pMaxCell=', pmax_cell, ' xyz=', mesh%cCenters(pmax_cell,:), &
-			' uMaxCell=', umax_cell, ' |U|=', umax_val
+			' uMaxCell=', umax_cell, ' |U|=', umax_val, ' rawDp=', p_range
+		if (p_range > SIMPLE_MAX_PRESSURE_RANGE .or. umax_val > SIMPLE_MAX_SPEED) then
+			write(*,'(A,ES11.3,A,F10.3,A)') '  diag warning: rawDp=', p_range, &
+				' Umax=', umax_val, ' exceeds diagnostic target; not clipped.'
+		end if
 
 		do b = 1, min(ss%nBoundaries, size(bcs))
 			nFacesB = 0; b_psum = 0.0d0; b_umax = 0.0d0; b_flux = 0.0d0
