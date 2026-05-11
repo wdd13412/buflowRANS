@@ -4547,6 +4547,7 @@ function triangleCentroid(points)
 					' SIMPLEC', iter, '  res(u,v,p)=', res_u, res_v, res_p, &
 					'  Umax=', maxval(sqrt(ss%u**2+ss%v**2+ss%w**2)), &
 					'  dp=', maxval(ss%p)-minval(ss%p)
+				call simplec_report_diagnostics(mesh, ss, boundaryConditions, iter)
 				call flush(6)
 			end if
 			
@@ -5043,6 +5044,69 @@ function triangleCentroid(points)
 			end do
 		end do
 	end subroutine simplec_apply_low_mach_bounds
+
+!-----------------------------------------------------------------------
+! SIMPLEC 诊断：定位压力/速度极值和各边界状态，避免只看全局极值
+!-----------------------------------------------------------------------
+	subroutine simplec_report_diagnostics(mesh, ss, bcs, iter)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(in) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		integer, intent(in) :: iter
+		integer :: c, b, fi, face_idx, oc, pmin_cell, pmax_cell, umax_cell, nFacesB
+		real(kind=8) :: speed, pmin_val, pmax_val, umax_val
+		real(kind=8) :: b_pmin, b_pmax, b_psum, b_umax, b_flux
+		character(len=100) :: bname
+
+		pmin_cell = 1; pmax_cell = 1; umax_cell = 1
+		pmin_val = ss%p(1); pmax_val = ss%p(1)
+		umax_val = sqrt(ss%u(1)**2 + ss%v(1)**2 + ss%w(1)**2)
+		do c = 2, ss%nCells
+			if (ss%p(c) < pmin_val) then
+				pmin_val = ss%p(c); pmin_cell = c
+			end if
+			if (ss%p(c) > pmax_val) then
+				pmax_val = ss%p(c); pmax_cell = c
+			end if
+			speed = sqrt(ss%u(c)**2 + ss%v(c)**2 + ss%w(c)**2)
+			if (speed > umax_val) then
+				umax_val = speed; umax_cell = c
+			end if
+		end do
+
+		write(*,'(A,I6,A,I8,A,3F10.4,A,I8,A,3F10.4,A,I8,A,F10.4)') &
+			'  diag', iter, ' pMinCell=', pmin_cell, ' xyz=', mesh%cCenters(pmin_cell,:), &
+			' pMaxCell=', pmax_cell, ' xyz=', mesh%cCenters(pmax_cell,:), &
+			' uMaxCell=', umax_cell, ' |U|=', umax_val
+
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			nFacesB = 0; b_psum = 0.0d0; b_umax = 0.0d0; b_flux = 0.0d0
+			b_pmin = huge(1.0d0); b_pmax = -huge(1.0d0)
+			bname = 'boundary'
+			if (allocated(mesh%boundaryNames) .and. b <= size(mesh%boundaryNames)) then
+				bname = trim(adjustl(mesh%boundaryNames(b)))
+			end if
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx<1 .or. face_idx>ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1)
+				if (oc<1 .or. oc>ss%nCells) cycle
+				nFacesB = nFacesB + 1
+				b_psum = b_psum + ss%p(oc)
+				b_pmin = min(b_pmin, ss%p(oc)); b_pmax = max(b_pmax, ss%p(oc))
+				speed = sqrt(ss%u(oc)**2 + ss%v(oc)**2 + ss%w(oc)**2)
+				b_umax = max(b_umax, speed)
+				b_flux = b_flux + ss%phi_f(face_idx)
+			end do
+			if (nFacesB > 0) then
+				write(*,'(A,I2,1X,A,A,ES11.3,A,ES11.3,A,ES11.3,A,F8.3,A,ES11.3)') &
+					'    bc', b, trim(bname), ' pAvg=', b_psum/dble(nFacesB), &
+					' pMin=', b_pmin, ' pMax=', b_pmax, ' uMax=', b_umax, ' flux=', b_flux
+			end if
+		end do
+	end subroutine simplec_report_diagnostics
 
 !-----------------------------------------------------------------------
 ! 全局质量通量修正
