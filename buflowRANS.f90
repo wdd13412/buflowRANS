@@ -1414,10 +1414,9 @@ end subroutine decodePrimitives3D_RANS
 		allocate(temp_grad(nCells, 1, 3))
 		temp_grad = greenGaussGrad_RANS(mesh, P_matrix, .false.)
 		allocate(gradP(nCells, 3))
-		!gradP = temp_grad(:, :, 1)
+		! Density-based JST pressure sensor follows the original x-gradient-only form.
+		gradP = 0.0d0
 		gradP(:,1) = temp_grad(:,1,1)
-		gradP(:,2) = temp_grad(:,1,2)
-		gradP(:,3) = temp_grad(:,1,3)
 		
 		allocate(sj(nCells), sjCount(nCells))
 		sj = 0.0d0
@@ -4405,9 +4404,10 @@ function triangleCentroid(points)
 				allocate(boundaryConditions(b)%params(0))
 				print *, '  ', trim(bname), ' -> empty/slip'
 			case ('symmetry', 'symmetryPlane')
-				boundaryConditions(b)%type = emptyBoundary
+				! Match the density-based solver's historical treatment.
+				boundaryConditions(b)%type = wallBoundary
 				allocate(boundaryConditions(b)%params(0))
-				print *, '  ', trim(bname), ' -> symmetry/slip'
+				print *, '  ', trim(bname), ' -> symmetry/wall'
 			case ('inlet', 'Inlet')
 				boundaryConditions(b)%type = InletBoundary
 				allocate(boundaryConditions(b)%params(6))
@@ -4606,7 +4606,10 @@ function triangleCentroid(points)
 		allocate(tg(ss%nCells, 1, 3))
 		tg = greenGaussGrad_RANS(mesh, pm, .false.)
 		allocate(gP(ss%nCells, 3))
-		gP(:,1) = tg(:,1,1); gP(:,2) = tg(:,1,2); gP(:,3) = tg(:,1,3)
+		! Keep SIMPLEC pressure-gradient coupling consistent with the density JST sensor:
+		! use the streamwise pressure gradient only.
+		gP = 0.0d0
+		gP(:,1) = tg(:,1,1)
 		deallocate(tg, pm)
 		
 		aP = 0.0d0; bU = 0.0d0; bV = 0.0d0; bW = 0.0d0
@@ -4766,7 +4769,9 @@ function triangleCentroid(points)
 		allocate(tg(ss%nCells, 1, 3))
 		tg = greenGaussGrad_RANS(mesh, pm, .false.)
 		allocate(gP(ss%nCells, 3))
-		gP(:,1) = tg(:,1,1); gP(:,2) = tg(:,1,2); gP(:,3) = tg(:,1,3)
+		! Rhie-Chow pressure interpolation uses the same x-gradient-only pressure model.
+		gP = 0.0d0
+		gP(:,1) = tg(:,1,1)
 		deallocate(tg, pm)
 		
 		aP_pp = 0.0d0; src = 0.0d0
@@ -4864,7 +4869,9 @@ function triangleCentroid(points)
 		allocate(tg(ss%nCells, 1, 3))
 		tg = greenGaussGrad_RANS(mesh, pm, .false.)
 		allocate(gPp(ss%nCells, 3))
-		gPp(:,1) = tg(:,1,1); gPp(:,2) = tg(:,1,2); gPp(:,3) = tg(:,1,3)
+		! Correct velocity only with the streamwise pressure-correction gradient.
+		gPp = 0.0d0
+		gPp(:,1) = tg(:,1,1)
 		deallocate(tg, pm)
 		
 		! 速度修正：用未松弛的 aP_u
