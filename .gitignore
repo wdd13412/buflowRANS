@@ -1,0 +1,17 @@
+# Compiled binary and module files
+buflowRANS
+buflow_run
+*.mod
+
+# Solver output
+FvCFDRestart.txt
+solution_RANS.*.vtk
+solution_SIMPLE.*.vtk
+*.vtk
+
+# Generated mesh data
+mesh/
+
+# Python cache
+__pycache__/
+*.pyc
