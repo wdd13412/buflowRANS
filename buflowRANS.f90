@@ -4408,10 +4408,10 @@ function triangleCentroid(points)
 				allocate(boundaryConditions(b)%params(0))
 				print *, '  ', trim(bname), ' -> empty/slip'
 			case ('symmetry', 'symmetryPlane')
-				! Match the density-based solver's historical treatment.
-				boundaryConditions(b)%type = wallBoundary
+				! Symmetry/farfield planes are slip boundaries, not no-slip body walls.
+				boundaryConditions(b)%type = emptyBoundary
 				allocate(boundaryConditions(b)%params(0))
-				print *, '  ', trim(bname), ' -> symmetry/wall'
+				print *, '  ', trim(bname), ' -> symmetry/slip'
 			case ('inlet', 'Inlet')
 				boundaryConditions(b)%type = InletBoundary
 				allocate(boundaryConditions(b)%params(6))
@@ -4610,11 +4610,12 @@ function triangleCentroid(points)
 		allocate(tg(ss%nCells, 1, 3))
 		tg = greenGaussGrad_RANS(mesh, pm, .false.)
 		allocate(gP(ss%nCells, 3))
-		! Use the streamwise pressure gradient in the current low-Mach SIMPLEC model.
-		! The cross-stream coupling is stabilised through Rhie-Chow fluxes and
-		! pressure-correction damping rather than direct wall-normal pressure forcing.
-		gP = 0.0d0
+		! Use the full pressure gradient in SIMPLEC momentum.  The previous
+		! streamwise-only approximation kept v nearly frozen and produced
+		! contour plots dominated by a one-dimensional pressure ramp.
 		gP(:,1) = tg(:,1,1)
+		gP(:,2) = tg(:,1,2)
+		gP(:,3) = tg(:,1,3)
 		deallocate(tg, pm)
 		
 		aP = 0.0d0; bU = 0.0d0; bV = 0.0d0; bW = 0.0d0
@@ -4783,9 +4784,11 @@ function triangleCentroid(points)
 		allocate(tg(ss%nCells, 1, 3))
 		tg = greenGaussGrad_RANS(mesh, pm, .false.)
 		allocate(gP(ss%nCells, 3))
-		! Keep Rhie-Chow interpolation consistent with the streamwise pressure model.
-		gP = 0.0d0
+		! Rhie-Chow interpolation must use the same full pressure gradient as
+		! the momentum equation to suppress checkerboard modes in every direction.
 		gP(:,1) = tg(:,1,1)
+		gP(:,2) = tg(:,1,2)
+		gP(:,3) = tg(:,1,3)
 		deallocate(tg, pm)
 		
 		aP_pp = 0.0d0; src = 0.0d0
@@ -4891,9 +4894,10 @@ function triangleCentroid(points)
 		allocate(tg(ss%nCells, 1, 3))
 		tg = greenGaussGrad_RANS(mesh, pm, .false.)
 		allocate(gPp(ss%nCells, 3))
-		! Correct velocity consistently with the streamwise pressure-correction model.
-		gPp = 0.0d0
+		! Correct every velocity component with the full pressure-correction gradient.
 		gPp(:,1) = tg(:,1,1)
+		gPp(:,2) = tg(:,1,2)
+		gPp(:,3) = tg(:,1,3)
 		deallocate(tg, pm)
 		
 		! 速度修正：用未松弛的 aP_u
@@ -5015,14 +5019,26 @@ function triangleCentroid(points)
 		type(BoundaryCondition), intent(in) :: bcs(:)
 		integer, intent(in) :: iter
 		integer :: c, b, fi, face_idx, oc, pmin_cell, pmax_cell, umax_cell, nFacesB
+		integer :: n_wall, n_front, n_roof, n_rear, n_wake, n_upstream
 		real(kind=8) :: speed, pmin_val, pmax_val, umax_val, p_range
 		real(kind=8) :: b_pmin, b_pmax, b_psum, b_umax, b_flux
+		real(kind=8) :: v_abs_max, v_rms, x_min, x_max, y_min, y_max, xw_min, xw_max, yw_min, yw_max
+		real(kind=8) :: wall_dx, wall_dy, front_p, roof_p, rear_p, wake_u, upstream_u, wake_deficit
+		logical, allocatable :: wall_cell(:)
 		character(len=100) :: bname
 
+		allocate(wall_cell(ss%nCells)); wall_cell = .false.
 		pmin_cell = 1; pmax_cell = 1; umax_cell = 1
 		pmin_val = ss%p(1); pmax_val = ss%p(1)
 		umax_val = sqrt(ss%u(1)**2 + ss%v(1)**2 + ss%w(1)**2)
+		v_abs_max = abs(ss%v(1)); v_rms = ss%v(1)**2
+		x_min = mesh%cCenters(1,1); x_max = mesh%cCenters(1,1)
+		y_min = mesh%cCenters(1,2); y_max = mesh%cCenters(1,2)
 		do c = 2, ss%nCells
+			x_min = min(x_min, mesh%cCenters(c,1)); x_max = max(x_max, mesh%cCenters(c,1))
+			y_min = min(y_min, mesh%cCenters(c,2)); y_max = max(y_max, mesh%cCenters(c,2))
+			v_abs_max = max(v_abs_max, abs(ss%v(c)))
+			v_rms = v_rms + ss%v(c)**2
 			if (ss%p(c) < pmin_val) then
 				pmin_val = ss%p(c); pmin_cell = c
 			end if
@@ -5034,6 +5050,7 @@ function triangleCentroid(points)
 				umax_val = speed; umax_cell = c
 			end if
 		end do
+		v_rms = sqrt(v_rms / dble(ss%nCells))
 
 		p_range = pmax_val - pmin_val
 		write(*,'(A,I6,A,I8,A,3F10.4,A,I8,A,3F10.4,A,I8,A,F10.4,A,ES11.3)') &
@@ -5071,6 +5088,76 @@ function triangleCentroid(points)
 					' pMin=', b_pmin, ' pMax=', b_pmax, ' uMax=', b_umax, ' flux=', b_flux
 			end if
 		end do
+
+
+		! Spatial sanity diagnostics for contour plots.  A physically meaningful
+		! car/airfoil low-Mach solution should not look like a pure one-dimensional
+		! inlet-to-outlet ramp: wall sectors and wake/upstream samples should expose
+		! stagnation, roof/rear suction and wake velocity deficit trends.
+		n_wall = 0
+		xw_min = huge(1.0d0); xw_max = -huge(1.0d0)
+		yw_min = huge(1.0d0); yw_max = -huge(1.0d0)
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			if (bcs(b)%type /= wallBoundary) cycle
+			bname = 'boundary'
+			if (allocated(mesh%boundaryNames) .and. b <= size(mesh%boundaryNames)) then
+				bname = trim(adjustl(mesh%boundaryNames(b)))
+			end if
+			! Symmetry/slip patches are not the car/airfoil body for contour-physics
+			! sector diagnostics.
+			if (index(bname, 'symmetry') > 0) cycle
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx<1 .or. face_idx>ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1)
+				if (oc<1 .or. oc>ss%nCells) cycle
+				if (.not. wall_cell(oc)) then
+					wall_cell(oc) = .true.; n_wall = n_wall + 1
+					xw_min = min(xw_min, mesh%cCenters(oc,1)); xw_max = max(xw_max, mesh%cCenters(oc,1))
+					yw_min = min(yw_min, mesh%cCenters(oc,2)); yw_max = max(yw_max, mesh%cCenters(oc,2))
+				end if
+			end do
+		end do
+
+		front_p = 0.0d0; roof_p = 0.0d0; rear_p = 0.0d0; wake_u = 0.0d0; upstream_u = 0.0d0
+		n_front = 0; n_roof = 0; n_rear = 0; n_wake = 0; n_upstream = 0
+		if (n_wall > 0) then
+			wall_dx = max(xw_max - xw_min, 1.0d-12)
+			wall_dy = max(yw_max - yw_min, 1.0d-12)
+			do c = 1, ss%nCells
+				if (wall_cell(c)) then
+					if (mesh%cCenters(c,1) <= xw_min + 0.15d0*wall_dx) then
+						front_p = front_p + ss%p(c); n_front = n_front + 1
+					end if
+					if (mesh%cCenters(c,2) >= yw_min + 0.70d0*wall_dy) then
+						roof_p = roof_p + ss%p(c); n_roof = n_roof + 1
+					end if
+					if (mesh%cCenters(c,1) >= xw_max - 0.15d0*wall_dx) then
+						rear_p = rear_p + ss%p(c); n_rear = n_rear + 1
+					end if
+				end if
+				if (mesh%cCenters(c,1) > xw_max + 0.05d0*wall_dx .and. &
+				    mesh%cCenters(c,2) >= yw_min .and. mesh%cCenters(c,2) <= yw_max) then
+					wake_u = wake_u + ss%u(c); n_wake = n_wake + 1
+				end if
+				if (mesh%cCenters(c,1) < xw_min - 0.05d0*wall_dx .and. &
+				    mesh%cCenters(c,2) >= yw_min .and. mesh%cCenters(c,2) <= yw_max) then
+					upstream_u = upstream_u + ss%u(c); n_upstream = n_upstream + 1
+				end if
+			end do
+			if (n_front > 0) front_p = front_p / dble(n_front)
+			if (n_roof > 0) roof_p = roof_p / dble(n_roof)
+			if (n_rear > 0) rear_p = rear_p / dble(n_rear)
+			if (n_wake > 0) wake_u = wake_u / dble(n_wake)
+			if (n_upstream > 0) upstream_u = upstream_u / dble(n_upstream)
+			wake_deficit = upstream_u - wake_u
+			write(*,'(A,I6,A,ES11.3,A,ES11.3,A,ES11.3,A,ES11.3,A,ES11.3,A,ES11.3,A,ES11.3)') &
+				'  phys', iter, ' vMax=', v_abs_max, ' vRms=', v_rms, ' frontP=', front_p, &
+				' roofP=', roof_p, ' rearP=', rear_p, ' wakeUx=', wake_u, ' wakeDef=', wake_deficit
+		end if
+
+		deallocate(wall_cell)
 	end subroutine simplec_report_diagnostics
 
 !-----------------------------------------------------------------------

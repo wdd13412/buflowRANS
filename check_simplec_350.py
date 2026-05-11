@@ -24,6 +24,12 @@ SIMPLEC_RE = re.compile(
 )
 DIAG_RE = re.compile(r"diag\s+(?P<iter>\d+)\b.*rawDp=\s*(?P<raw_dp>[*+\-0-9.Ee]+)")
 BC_RE = re.compile(r"\bbc\s+(?P<index>\d+)\s+.*?flux=\s*(?P<flux>[*+\-0-9.Ee]+)")
+PHYS_RE = re.compile(
+    r"phys\s+(?P<iter>\d+)\s+vMax=\s*(?P<vmax>[*+\-0-9.Ee]+)\s+"
+    r"vRms=\s*(?P<vrms>[*+\-0-9.Ee]+)\s+frontP=\s*(?P<frontp>[*+\-0-9.Ee]+)\s+"
+    r"roofP=\s*(?P<roofp>[*+\-0-9.Ee]+)\s+rearP=\s*(?P<rearp>[*+\-0-9.Ee]+)\s+"
+    r"wakeUx=\s*(?P<wakeux>[*+\-0-9.Ee]+)\s+wakeDef=\s*(?P<wakedef>[*+\-0-9.Ee]+)"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,6 +61,18 @@ def parse_args() -> argparse.Namespace:
         "--skip-diagnostics-check",
         action="store_true",
         help="stop at the target SIMPLEC line without waiting for the diagnostic block",
+    )
+    parser.add_argument(
+        "--min-vmax",
+        type=float,
+        default=5.0e-2,
+        help="minimum target cross-stream velocity magnitude; catches frozen 1-D flow fields",
+    )
+    parser.add_argument(
+        "--max-wake-accel",
+        type=float,
+        default=0.5,
+        help="maximum allowed negative wake deficit, i.e. wake acceleration over upstream Ux",
     )
     return parser.parse_args()
 
@@ -128,6 +146,8 @@ def main() -> int:
     last_dp: float | None = None
     target_reached = False
     target_diag_seen = False
+    mass_check_done = False
+    mass_imbalance: float | None = None
     target_fluxes: list[float] = []
 
     assert proc.stdout is not None
@@ -137,7 +157,8 @@ def main() -> int:
                 print(
                     f"ERROR: timeout after {args.timeout:.1f}s before completing SIMPLEC {args.target_iter}; "
                     f"last iter={last_iter}, Umax={last_umax}, dp={last_dp}, "
-                    f"target_diag_seen={target_diag_seen}, flux_lines={len(target_fluxes)}",
+                    f"target_diag_seen={target_diag_seen}, flux_lines={len(target_fluxes)}, "
+                    f"mass_check_done={mass_check_done}",
                     file=sys.stderr,
                 )
                 stop_process(proc)
@@ -208,17 +229,46 @@ def main() -> int:
                     stop_process(proc)
                     return 1
 
-                if len(target_fluxes) >= args.expected_boundaries:
-                    stop_process(proc)
+                if len(target_fluxes) >= args.expected_boundaries and not mass_check_done:
                     mass_imbalance = abs(sum(target_fluxes))
-                    checks_ok = mass_imbalance <= args.max_mass_imbalance
-                    _, messages = validate_ranges(args, last_iter or args.target_iter, last_umax or 0.0, last_dp or 0.0)
-                    messages.append(f"mass imbalance={mass_imbalance:.3e} <= {args.max_mass_imbalance:.3e}")
-                    if checks_ok:
-                        print("PASS: " + ", ".join(messages))
-                        return 0
-                    print("ERROR: mass balance check failed: " + ", ".join(messages), file=sys.stderr)
+                    mass_check_done = True
+                    if mass_imbalance > args.max_mass_imbalance:
+                        stop_process(proc)
+                        _, messages = validate_ranges(args, last_iter or args.target_iter, last_umax or 0.0, last_dp or 0.0)
+                        messages.append(f"mass imbalance={mass_imbalance:.3e} <= {args.max_mass_imbalance:.3e}")
+                        print("ERROR: mass balance check failed: " + ", ".join(messages), file=sys.stderr)
+                        return 1
+                    continue
+
+            phys_match = PHYS_RE.search(line)
+            if target_reached and phys_match is not None and int(phys_match.group("iter")) >= args.target_iter:
+                try:
+                    vmax = finite_float(phys_match.group("vmax"), "vMax", line)
+                    frontp = finite_float(phys_match.group("frontp"), "frontP", line)
+                    roofp = finite_float(phys_match.group("roofp"), "roofP", line)
+                    rearp = finite_float(phys_match.group("rearp"), "rearP", line)
+                    wakedef = finite_float(phys_match.group("wakedef"), "wakeDef", line)
+                except ValueError as exc:
+                    print(f"ERROR: {exc}", file=sys.stderr)
+                    stop_process(proc)
                     return 1
+
+                _, messages = validate_ranges(args, last_iter or args.target_iter, last_umax or 0.0, last_dp or 0.0)
+                messages.append(f"mass imbalance={mass_imbalance:.3e} <= {args.max_mass_imbalance:.3e}")
+                messages.append(f"vMax={vmax:.3e} >= {args.min_vmax:.3e}")
+                messages.append(f"frontP={frontp:.3e} > roofP={roofp:.3e} > rearP={rearp:.3e}")
+                messages.append(f"wakeDef={wakedef:.3e} >= -{args.max_wake_accel:.3e}")
+
+                physics_ok = mass_check_done and mass_imbalance is not None
+                physics_ok = physics_ok and vmax >= args.min_vmax
+                physics_ok = physics_ok and frontp > roofp and roofp > rearp
+                physics_ok = physics_ok and wakedef >= -args.max_wake_accel
+                stop_process(proc)
+                if physics_ok:
+                    print("PASS: " + ", ".join(messages))
+                    return 0
+                print("ERROR: contour-physics check failed: " + ", ".join(messages), file=sys.stderr)
+                return 1
     except KeyboardInterrupt:
         try:
             os.killpg(proc.pid, signal.SIGTERM)
