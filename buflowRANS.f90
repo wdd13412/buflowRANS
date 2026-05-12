@@ -56,6 +56,7 @@ module BuFlowModule
     real(kind=8), parameter :: SIMPLEC_D_DIAG_FLOOR = 0.5d0
     real(kind=8), parameter :: SIMPLEC_RC_DAMPING = 0.3d0
     real(kind=8), parameter :: SIMPLEC_MAX_PRESSURE_STEP_FACTOR = 0.001d0
+    real(kind=8), parameter :: SIMPLEC_WALL_DIFFUSION_BOOST = 5.0d0
     real(kind=8), parameter :: SIMPLE_MAX_SPEED = 17.0d0
     real(kind=8), parameter :: SIMPLE_MAX_PRESSURE_RANGE = 200.0d0
     integer, parameter :: SIMPLE_OUTPUT_INTERVAL = 50
@@ -4676,7 +4677,10 @@ function triangleCentroid(points)
 				
 				select case(bcs(b)%type)
 				case(wallBoundary)
-					a_d = mu_e * fn_m / d_m
+					! Coarse car meshes under-resolve the boundary layer; boost the
+					! no-slip wall diffusion so the wall momentum deficit is not confined
+					! to a single cell layer in velocity contours.
+					a_d = SIMPLEC_WALL_DIFFUSION_BOOST * mu_e * fn_m / d_m
 					aP(oc) = aP(oc) + a_d
 				case(InletBoundary)
 					phi_f = ss%phi_f(face_idx)
