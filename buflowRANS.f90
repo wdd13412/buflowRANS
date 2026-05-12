@@ -43,8 +43,8 @@ module BuFlowModule
     !===========================================================================
     ! SIMPLE solver parameters
     !===========================================================================
-    real(kind=8), parameter :: SIMPLE_ALPHA_U = 0.02d0
-    real(kind=8), parameter :: SIMPLE_ALPHA_P = 0.01d0
+    real(kind=8), parameter :: SIMPLE_ALPHA_U = 0.20d0
+    real(kind=8), parameter :: SIMPLE_ALPHA_P = 0.02d0
     real(kind=8), parameter :: SIMPLE_ALPHA_K = 0.5d0
     real(kind=8), parameter :: SIMPLE_ALPHA_OMEGA = 0.5d0
     integer, parameter :: SIMPLE_MAX_ITER = 3000
@@ -52,7 +52,7 @@ module BuFlowModule
     integer, parameter :: SIMPLE_MAX_INNER_P = 1000
     real(kind=8), parameter :: SIMPLE_TOLERANCE = 1.0d-6
     real(kind=8), parameter :: SIMPLE_PCG_TOLERANCE = 1.0d-10
-    real(kind=8), parameter :: SIMPLEC_PSEUDO_CFL = 0.05d0
+    real(kind=8), parameter :: SIMPLEC_PSEUDO_CFL = 5.0d0
     real(kind=8), parameter :: SIMPLEC_D_DIAG_FLOOR = 0.5d0
     real(kind=8), parameter :: SIMPLEC_RC_DAMPING = 0.3d0
     real(kind=8), parameter :: SIMPLEC_MAX_PRESSURE_STEP_FACTOR = 0.001d0
