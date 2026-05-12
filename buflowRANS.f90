@@ -63,6 +63,8 @@ module BuFlowModule
     real(kind=8), parameter :: SIMPLE_MAX_PRESSURE_RANGE = 200.0d0
     integer, parameter :: SIMPLE_OUTPUT_INTERVAL = 50
     real(kind=8), parameter :: SIMPLE_INLET_BUFFER_WIDTH_CELLS = 8.0d0
+    real(kind=8), parameter :: SIMPLEC_WALL_MU_T_FLOOR_FACTOR = 80.0d0
+    real(kind=8), parameter :: SIMPLEC_WALL_MU_T_CAP_FACTOR = 1000.0d0
     logical, parameter :: DEBUG_MESH_VERBOSE = .false.
     !===========================================================================
     
@@ -4524,12 +4526,13 @@ function triangleCentroid(points)
 			w_old = ss%w
 			p_old = ss%p
 			
-			! 更新湍流粘性。这里不再额外施加强制壁函数/壁面扩散增强，
-			! 避免把车身速度亏损人为压缩到第一层单元。
+			! 更新湍流粘性，并为壁面相邻单元施加混合长度涡黏性下限，
+			! 让 no-slip 速度亏损能通过内部面扩散到第二/第三层单元。
 			do c = 1, ss%nCells
 				ss%mu_t(c) = rho * max(ss%k(c),SMALL_NUM) / max(ss%omega(c),SMALL_NUM)
 				ss%mu_t(c) = min(ss%mu_t(c), 1.0d4 * ss%mu_l(c))
 			end do
+			call simple_apply_wall_functions(mesh, ss, boundaryConditions, fluid)
 			
 			! 步骤1：求解动量方程
 			call simplec_momentum(mesh, ss, boundaryConditions, fluid, U_init)
@@ -5184,8 +5187,118 @@ function triangleCentroid(points)
 				' roofP=', roof_p, ' rearP=', rear_p, ' wakeUx=', wake_u, ' wakeDef=', wake_deficit
 		end if
 
+		call simplec_report_physics_checks(mesh, ss, bcs, iter)
+
 		deallocate(wall_cell)
 	end subroutine simplec_report_diagnostics
+
+
+!-----------------------------------------------------------------------
+! SIMPLEC 物理核查：近壁层、入口、质量和压力-速度耦合健康度
+!-----------------------------------------------------------------------
+	subroutine simplec_report_physics_checks(mesh, ss, bcs, iter)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(in) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		integer, intent(in) :: iter
+		integer :: c, b, fi, face_idx, oc, layer, counts(4), inletCount, outletCount
+		real(kind=8) :: speed, y, y_min, Uref, layerUSum(4), layerMuRatio(4)
+		real(kind=8) :: inletFlux, outletFlux, inletUmin, inletUavg, outletUavg, pRange
+		real(kind=8) :: aPmin, aPmax, pPrimeMax, massImb
+
+		counts = 0; layerUSum = 0.0d0; layerMuRatio = 0.0d0
+		inletFlux = 0.0d0; outletFlux = 0.0d0; inletCount = 0; outletCount = 0
+		inletUmin = huge(1.0d0); inletUavg = 0.0d0; outletUavg = 0.0d0
+		Uref = max(maxval(sqrt(ss%u**2 + ss%v**2 + ss%w**2)), 1.0d-12)
+		pRange = maxval(ss%p) - minval(ss%p)
+		aPmin = minval(ss%aP_u); aPmax = maxval(ss%aP_u)
+		pPrimeMax = maxval(abs(ss%p_prime))
+
+		y_min = huge(1.0d0)
+		if (allocated(mesh%wallDistance)) then
+			do c = 1, ss%nCells
+				if (mesh%wallDistance(c) > 1.0d-12) y_min = min(y_min, mesh%wallDistance(c))
+			end do
+		end if
+		if (y_min == huge(1.0d0)) y_min = max(minval(mesh%cVols)**(1.0d0/3.0d0), 1.0d-12)
+
+		do c = 1, ss%nCells
+			if (allocated(mesh%wallDistance)) then
+				y = max(mesh%wallDistance(c), y_min)
+			else
+				y = y_min
+			end if
+			if (y <= 1.5d0*y_min) then
+				layer = 1
+			else if (y <= 3.0d0*y_min) then
+				layer = 2
+			else if (y <= 6.0d0*y_min) then
+				layer = 3
+			else
+				layer = 4
+			end if
+			speed = sqrt(ss%u(c)**2 + ss%v(c)**2 + ss%w(c)**2)
+			counts(layer) = counts(layer) + 1
+			layerUSum(layer) = layerUSum(layer) + speed
+			layerMuRatio(layer) = layerMuRatio(layer) + ss%mu_t(c) / max(ss%mu_l(c), 1.0d-30)
+		end do
+
+		do layer = 1, 4
+			if (counts(layer) > 0) then
+				layerUSum(layer) = layerUSum(layer) / dble(counts(layer))
+				layerMuRatio(layer) = layerMuRatio(layer) / dble(counts(layer))
+			end if
+		end do
+
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx<1 .or. face_idx>ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1)
+				if (oc<1 .or. oc>ss%nCells) cycle
+				speed = sqrt(ss%u(oc)**2 + ss%v(oc)**2 + ss%w(oc)**2)
+				select case (bcs(b)%type)
+				case (InletBoundary)
+					inletFlux = inletFlux + ss%phi_f(face_idx)
+					inletUmin = min(inletUmin, speed)
+					inletUavg = inletUavg + speed
+					inletCount = inletCount + 1
+				case (OutletBoundary)
+					outletFlux = outletFlux + ss%phi_f(face_idx)
+					outletUavg = outletUavg + speed
+					outletCount = outletCount + 1
+				end select
+			end do
+		end do
+		if (inletCount > 0) inletUavg = inletUavg / dble(inletCount)
+		if (outletCount > 0) outletUavg = outletUavg / dble(outletCount)
+		massImb = inletFlux + outletFlux
+
+		write(*,'(A,I6,A,ES10.3,A,ES10.3,A,ES10.3,A,ES10.3,A,ES10.3,A,ES10.3)') &
+			'  check', iter, ' massImb=', massImb, ' pPrimeMax=', pPrimeMax, &
+			' pRange=', pRange, ' aPuMin=', aPmin, ' aPuMax=', aPmax, ' Uref=', Uref
+		write(*,'(A,I6,A,F8.3,A,F8.3,A,F8.3,A,F8.3,A,F8.3,A,F8.3)') &
+			'  wallLayer', iter, ' U1=', layerUSum(1), ' U2=', layerUSum(2), &
+			' U3=', layerUSum(3), ' Ufar=', layerUSum(4), ' muT1/mu=', layerMuRatio(1), &
+			' muT2/mu=', layerMuRatio(2)
+		write(*,'(A,I6,A,F8.3,A,F8.3,A,F8.3,A,ES10.3,A)') &
+			'  bcCheck', iter, ' inletUmin=', inletUmin, ' inletUavg=', inletUavg, &
+			' outletUavg=', outletUavg, ' fluxSum=', massImb, ' (inlet/outlet should balance)'
+		if (counts(1) > 0 .and. counts(2) > 0) then
+			if (abs(Uref-layerUSum(1)) > 3.0d0*max(abs(Uref-layerUSum(2)), 1.0d-6)) then
+				write(*,'(A)') '  causeHint: wall deficit mostly first-layer only; near-wall mu_t or wall-normal mesh is suspect.'
+			end if
+		end if
+		if (inletCount > 0 .and. inletUmin < 0.95d0*Uref) then
+			write(*,'(A)') '  causeHint: inlet owner cells are below freestream; inspect inlet pressure correction/Rhie-Chow coupling.'
+		end if
+		if (abs(massImb) > 1.0d-6*max(abs(inletFlux), 1.0d0)) then
+			write(*,'(A)') '  causeHint: inlet/outlet mass flux not balanced; pressure correction or outlet flux is suspect.'
+		end if
+	end subroutine simplec_report_physics_checks
+
 
 !-----------------------------------------------------------------------
 ! 全局质量通量修正
@@ -5297,7 +5410,7 @@ function triangleCentroid(points)
 		type(BoundaryCondition), intent(in) :: bcs(:)
 		type(Fluidd), intent(in) :: fluid
 		integer :: b, fi, face_idx, oc
-		real(kind=8) :: rho, y, speed, u_tau, omega_wall, mu_t_wall
+		real(kind=8) :: rho, y, speed, u_tau, mu_t_floor, mu_t_cap
 
 		rho = ss%rho_ref
 		do b = 1, min(ss%nBoundaries, size(bcs))
@@ -5312,12 +5425,11 @@ function triangleCentroid(points)
 				if (allocated(mesh%wallDistance)) y = max(min(y, mesh%wallDistance(oc)), 1.0d-8)
 				speed = sqrt(ss%u(oc)**2 + ss%v(oc)**2 + ss%w(oc)**2)
 				u_tau = sqrt(max(fluid%mu_laminar * speed / (rho * y), SMALL_NUM))
-				omega_wall = max(6.0d0 * fluid%mu_laminar / (rho * max(BETA,SMALL_NUM) * y*y), &
-				                 u_tau / max(sqrt(BETA_STAR) * KAPPA * y, 1.0d-12))
-				ss%omega(oc) = max(ss%omega(oc), omega_wall)
-				ss%k(oc) = max(ss%k(oc), u_tau*u_tau / sqrt(BETA_STAR))
-				mu_t_wall = rho * KAPPA * y * u_tau
-				ss%mu_t(oc) = min(ss%mu_t(oc), max(mu_t_wall, 10.0d0*ss%mu_l(oc)))
+				! 混合长度型涡黏性下限：只增加不足的近壁扩散，不再强行压低 mu_t/k/omega。
+				mu_t_floor = rho * KAPPA * y * u_tau
+				mu_t_floor = max(mu_t_floor, SIMPLEC_WALL_MU_T_FLOOR_FACTOR * ss%mu_l(oc))
+				mu_t_cap = SIMPLEC_WALL_MU_T_CAP_FACTOR * ss%mu_l(oc)
+				ss%mu_t(oc) = min(max(ss%mu_t(oc), mu_t_floor), mu_t_cap)
 			end do
 		end do
 	end subroutine simple_apply_wall_functions
