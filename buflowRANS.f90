@@ -62,6 +62,7 @@ module BuFlowModule
     real(kind=8), parameter :: SIMPLE_MAX_SPEED = 17.0d0
     real(kind=8), parameter :: SIMPLE_MAX_PRESSURE_RANGE = 200.0d0
     integer, parameter :: SIMPLE_OUTPUT_INTERVAL = 50
+    real(kind=8), parameter :: SIMPLE_INLET_BUFFER_WIDTH_CELLS = 8.0d0
     logical, parameter :: DEBUG_MESH_VERBOSE = .false.
     !===========================================================================
     
@@ -5241,8 +5242,17 @@ function triangleCentroid(points)
 		type(SIMPLEState), intent(inout) :: ss
 		type(BoundaryCondition), intent(in) :: bcs(:)
 		real(kind=8), intent(in) :: U_in(3)
-		integer :: b, fi, face_idx, oc
+		integer :: b, fi, face_idx, oc, c
+		real(kind=8) :: U_mag, eU(3), s_face, s_owner, s_limit, max_owner_gap
+		logical :: has_inlet
 
+		U_mag = max(mag(U_in), 1.0d-12)
+		eU = U_in / U_mag
+		has_inlet = .false.
+		s_limit = -huge(1.0d0)
+		max_owner_gap = 0.0d0
+
+		! 先固定入口面相邻单元，同时估计入口法向第一层网格厚度。
 		do b = 1, min(ss%nBoundaries, size(bcs))
 			if (bcs(b)%type /= InletBoundary) cycle
 			do fi = 1, size(mesh%boundaryFaces, 2)
@@ -5254,7 +5264,26 @@ function triangleCentroid(points)
 				ss%u(oc) = U_in(1)
 				ss%v(oc) = U_in(2)
 				ss%w(oc) = U_in(3)
+				s_face = dot_product(mesh%fCenters(face_idx,:), eU)
+				s_owner = dot_product(mesh%cCenters(oc,:), eU)
+				s_limit = max(s_limit, s_face)
+				max_owner_gap = max(max_owner_gap, abs(s_owner - s_face))
+				has_inlet = .true.
 			end do
+		end do
+
+		if (.not. has_inlet) return
+		if (max_owner_gap <= 1.0d-12) max_owner_gap = maxval(mesh%cVols)**(1.0d0/3.0d0)
+		s_limit = s_limit + SIMPLE_INLET_BUFFER_WIDTH_CELLS * max_owner_gap
+
+		! 对入口后若干个上游缓冲层保持固定来流，防止压力修正/RC项在入口
+		! 内侧形成一条非物理低速带。缓冲厚度按入口第一层网格尺度定义。
+		do c = 1, ss%nCells
+			if (dot_product(mesh%cCenters(c,:), eU) <= s_limit) then
+				ss%u(c) = U_in(1)
+				ss%v(c) = U_in(2)
+				ss%w(c) = U_in(3)
+			end if
 		end do
 	end subroutine simple_enforce_inlet_velocity
 
