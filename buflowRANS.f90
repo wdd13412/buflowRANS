@@ -145,6 +145,7 @@ module BuFlowModule
 	integer, parameter :: emptyBoundary = 2
 	integer, parameter :: InletBoundary = 3
 	integer, parameter :: OutletBoundary = 4
+	integer, parameter :: movingWallBoundary = 5
 	
 	type CelllArray
 		type(Celll), allocatable :: cells(:)
@@ -1018,7 +1019,7 @@ end if
 		
 		do boundaryNumber = 1, nBoundaries
 			select case (boundaryConditions(boundaryNumber)%type)
-			case (wallBoundary)
+			case (wallBoundary, movingWallBoundary)
 				call updateWallBoundary_RANS(mesh, sln, boundaryNumber, &
 				                             boundaryConditions(boundaryNumber)%params, fluid)
 			case (emptyBoundary)
@@ -4358,7 +4359,7 @@ function triangleCentroid(points)
 		! Dispatch to selected solver
 		if (SOLVER_TYPE == SOLVER_SIMPLE) then
 			call configureBoundaryConditionsFromMesh(mesh, boundaryConditions, P, Pt, Tt, &
-			                                     UunitVec, k_init, omega_init)
+			                                     UunitVec, U, k_init, omega_init)
 			print *, ''
 			print *, '>>> Using SIMPLE pressure-based solver (low Mach) <<<'
 			call solve_SIMPLE(mesh, meshPath, boundaryConditions, fluid, &
@@ -4382,57 +4383,186 @@ function triangleCentroid(points)
 ! 根据 OpenFOAM boundary 名称配置边界条件，避免 SIMPLEC 依赖硬编码顺序
 !-----------------------------------------------------------------------
 	subroutine configureBoundaryConditionsFromMesh(mesh, boundaryConditions, P, Pt, Tt, &
-	                                             UunitVec, k_init, omega_init)
+	                                             UunitVec, U_in, k_init, omega_init)
 		implicit none
 		type(Meshh), intent(in) :: mesh
 		type(BoundaryCondition), allocatable, intent(inout) :: boundaryConditions(:)
-		real(kind=8), intent(in) :: P, Pt, Tt, UunitVec(3), k_init, omega_init
+		real(kind=8), intent(in) :: P, Pt, Tt, UunitVec(3), U_in(3), k_init, omega_init
 		integer :: b, nBoundaries
-		character(len=100) :: bname
+		real(kind=8) :: U_wall(3)
+		character(len=100) :: bname, bkey
 
 		if (.not. allocated(mesh%boundaryNames)) return
 		nBoundaries = size(mesh%boundaryNames)
 		if (allocated(boundaryConditions)) call freeBoundaryConditions(boundaryConditions)
 		allocate(boundaryConditions(nBoundaries))
+		U_wall = U_in
 
 		print *, 'Boundary condition mapping from OpenFOAM boundary names:'
+		print *, '  car/body/wall -> noSlip wall; ground/road/floor/bottom -> moving wall'
+		print *, '  sky/top/farfield/symmetry -> slip; left/minX -> inlet; right/maxX -> outlet'
 		do b = 1, nBoundaries
 			bname = trim(adjustl(mesh%boundaryNames(b)))
 			do while (len_trim(bname) > 0 .and. iachar(bname(1:1)) == 9)
 				bname = trim(adjustl(bname(2:)))
 			end do
-			select case (trim(bname))
-			case ('airfoil', 'car', 'wall', 'walls', 'body')
-				boundaryConditions(b)%type = wallBoundary
-				allocate(boundaryConditions(b)%params(0))
-				print *, '  ', trim(bname), ' -> wall'
-			case ('empty', 'frontAndBack')
-				boundaryConditions(b)%type = emptyBoundary
-				allocate(boundaryConditions(b)%params(0))
-				print *, '  ', trim(bname), ' -> empty/slip'
-			case ('symmetry', 'symmetryPlane')
-				! Symmetry/farfield planes are slip boundaries, not no-slip body walls.
-				boundaryConditions(b)%type = emptyBoundary
-				allocate(boundaryConditions(b)%params(0))
-				print *, '  ', trim(bname), ' -> symmetry/slip'
-			case ('inlet', 'Inlet')
+			bkey = lowercase_string(bname)
+			if (is_inlet_patch(bkey)) then
 				boundaryConditions(b)%type = InletBoundary
 				allocate(boundaryConditions(b)%params(6))
 				boundaryConditions(b)%params = [Pt, Tt, UunitVec(1), UunitVec(2), k_init, omega_init]
-				print *, '  ', trim(bname), ' -> inlet'
-			case ('outlet', 'Outlet')
+				print *, '  ', trim(bname), ' -> inlet fixed velocity'
+			else if (is_outlet_patch(bkey)) then
 				boundaryConditions(b)%type = OutletBoundary
 				allocate(boundaryConditions(b)%params(1))
 				boundaryConditions(b)%params(1) = P
-				print *, '  ', trim(bname), ' -> outlet'
-			case default
+				print *, '  ', trim(bname), ' -> outlet fixed pressure'
+			else if (is_slip_patch(bkey)) then
+				boundaryConditions(b)%type = emptyBoundary
+				allocate(boundaryConditions(b)%params(0))
+				print *, '  ', trim(bname), ' -> slip/symmetry'
+			else if (is_moving_ground_patch(bkey)) then
+				boundaryConditions(b)%type = movingWallBoundary
+				allocate(boundaryConditions(b)%params(3))
+				boundaryConditions(b)%params = U_wall
+				print *, '  ', trim(bname), ' -> moving ground wall'
+			else if (is_body_wall_patch(bkey)) then
 				boundaryConditions(b)%type = wallBoundary
 				allocate(boundaryConditions(b)%params(0))
-				print *, '  ', trim(bname), ' -> wall (default)'
-			end select
+				print *, '  ', trim(bname), ' -> noSlip wall'
+			else
+				call setBoundaryConditionFromGeometry(mesh, b, boundaryConditions(b), P, Pt, Tt, &
+				                                  UunitVec, U_wall, k_init, omega_init)
+				print *, '  ', trim(bname), ' -> ', trim(boundaryTypeName(boundaryConditions(b)%type)), &
+				         ' (geometry fallback)'
+			end if
 		end do
 		call flush(6)
 	end subroutine configureBoundaryConditionsFromMesh
+
+	function lowercase_string(text) result(out)
+		implicit none
+		character(len=*), intent(in) :: text
+		character(len=len(text)) :: out
+		integer :: i, code
+
+		out = text
+		do i = 1, len(text)
+			code = iachar(out(i:i))
+			if (code >= iachar('A') .and. code <= iachar('Z')) out(i:i) = achar(code + 32)
+		end do
+	end function lowercase_string
+
+	logical function is_inlet_patch(name)
+		implicit none
+		character(len=*), intent(in) :: name
+		is_inlet_patch = trim(name) == 'inlet' .or. trim(name) == 'left' .or. &
+		                 trim(name) == 'xmin' .or. trim(name) == 'minx' .or. &
+		                 trim(name) == 'xminus' .or. trim(name) == 'velocityinlet' .or. &
+		                 trim(name) == 'freestreaminlet'
+	end function is_inlet_patch
+
+	logical function is_outlet_patch(name)
+		implicit none
+		character(len=*), intent(in) :: name
+		is_outlet_patch = trim(name) == 'outlet' .or. trim(name) == 'right' .or. &
+		                  trim(name) == 'xmax' .or. trim(name) == 'maxx' .or. &
+		                  trim(name) == 'xplus' .or. trim(name) == 'pressureoutlet'
+	end function is_outlet_patch
+
+	logical function is_slip_patch(name)
+		implicit none
+		character(len=*), intent(in) :: name
+		is_slip_patch = trim(name) == 'empty' .or. trim(name) == 'frontandback' .or. &
+		                trim(name) == 'front' .or. trim(name) == 'back' .or. &
+		                trim(name) == 'symmetry' .or. trim(name) == 'symmetryplane' .or. &
+		                trim(name) == 'slip' .or. trim(name) == 'top' .or. &
+		                trim(name) == 'sky' .or. trim(name) == 'farfield' .or. &
+		                trim(name) == 'freestream' .or. trim(name) == 'upper' .or. &
+		                trim(name) == 'ymax' .or. trim(name) == 'maxy'
+	end function is_slip_patch
+
+	logical function is_moving_ground_patch(name)
+		implicit none
+		character(len=*), intent(in) :: name
+		is_moving_ground_patch = trim(name) == 'ground' .or. trim(name) == 'road' .or. &
+		                         trim(name) == 'floor' .or. trim(name) == 'bottom' .or. &
+		                         trim(name) == 'lower' .or. trim(name) == 'movingground' .or. &
+		                         trim(name) == 'movingwall' .or. trim(name) == 'ymin' .or. &
+		                         trim(name) == 'miny'
+	end function is_moving_ground_patch
+
+	logical function is_body_wall_patch(name)
+		implicit none
+		character(len=*), intent(in) :: name
+		is_body_wall_patch = trim(name) == 'airfoil' .or. trim(name) == 'car' .or. &
+		                   trim(name) == 'vehicle' .or. trim(name) == 'body' .or. &
+		                   trim(name) == 'wall' .or. trim(name) == 'walls' .or. &
+		                   trim(name) == 'noslip' .or. trim(name) == 'obstacle'
+	end function is_body_wall_patch
+
+	subroutine setBoundaryConditionFromGeometry(mesh, boundaryNumber, bc, P, Pt, Tt, &
+	                                           UunitVec, U_wall, k_init, omega_init)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		integer, intent(in) :: boundaryNumber
+		type(BoundaryCondition), intent(inout) :: bc
+		real(kind=8), intent(in) :: P, Pt, Tt, UunitVec(3), U_wall(3), k_init, omega_init
+		integer :: fi, face_idx, nFacesB
+		real(kind=8) :: x_min, x_max, y_min, y_max, x_avg, y_avg, x_span, y_span
+
+		x_min = minval(mesh%fCenters(:,1)); x_max = maxval(mesh%fCenters(:,1))
+		y_min = minval(mesh%fCenters(:,2)); y_max = maxval(mesh%fCenters(:,2))
+		x_avg = 0.0d0; y_avg = 0.0d0; nFacesB = 0
+		do fi = 1, size(mesh%boundaryFaces, 2)
+			face_idx = mesh%boundaryFaces(boundaryNumber, fi)
+			if (face_idx == 0) exit
+			if (face_idx<1 .or. face_idx>size(mesh%fCenters,1)) cycle
+			x_avg = x_avg + mesh%fCenters(face_idx,1)
+			y_avg = y_avg + mesh%fCenters(face_idx,2)
+			nFacesB = nFacesB + 1
+		end do
+		if (nFacesB > 0) then
+			x_avg = x_avg / dble(nFacesB); y_avg = y_avg / dble(nFacesB)
+		end if
+		x_span = max(x_max - x_min, 1.0d-12)
+		y_span = max(y_max - y_min, 1.0d-12)
+		if (x_avg <= x_min + 0.02d0*x_span) then
+			bc%type = InletBoundary
+			allocate(bc%params(6)); bc%params = [Pt, Tt, UunitVec(1), UunitVec(2), k_init, omega_init]
+		else if (x_avg >= x_max - 0.02d0*x_span) then
+			bc%type = OutletBoundary
+			allocate(bc%params(1)); bc%params(1) = P
+		else if (y_avg >= y_max - 0.02d0*y_span) then
+			bc%type = emptyBoundary
+			allocate(bc%params(0))
+		else if (y_avg <= y_min + 0.02d0*y_span) then
+			bc%type = movingWallBoundary
+			allocate(bc%params(3)); bc%params = U_wall
+		else
+			bc%type = wallBoundary
+			allocate(bc%params(0))
+		end if
+	end subroutine setBoundaryConditionFromGeometry
+
+	function boundaryTypeName(btype) result(name)
+		implicit none
+		integer, intent(in) :: btype
+		character(len=32) :: name
+		select case (btype)
+		case (InletBoundary)
+			name = 'inlet fixed velocity'
+		case (OutletBoundary)
+			name = 'outlet fixed pressure'
+		case (emptyBoundary)
+			name = 'slip/symmetry'
+		case (movingWallBoundary)
+			name = 'moving ground wall'
+		case default
+			name = 'noSlip wall'
+		end select
+	end function boundaryTypeName
+
 
 	subroutine freeBoundaryConditions(boundaryConditions)
 		implicit none
@@ -4679,12 +4809,19 @@ function triangleCentroid(points)
 				mu_e = ss%mu_l(oc) + ss%mu_t(oc)
 				
 				select case(bcs(b)%type)
-				case(wallBoundary)
+				case(wallBoundary, movingWallBoundary)
 					! Coarse car meshes under-resolve the boundary layer; boost the
 					! no-slip wall diffusion so the wall momentum deficit is not confined
 					! to a single cell layer in velocity contours.
 					a_d = SIMPLEC_WALL_DIFFUSION_BOOST * mu_e * fn_m / d_m
 					aP(oc) = aP(oc) + a_d
+					if (bcs(b)%type == movingWallBoundary .and. allocated(bcs(b)%params)) then
+						if (size(bcs(b)%params) >= 3) then
+							bU(oc) = bU(oc) + a_d * bcs(b)%params(1)
+							bV(oc) = bV(oc) + a_d * bcs(b)%params(2)
+							bW(oc) = bW(oc) + a_d * bcs(b)%params(3)
+						end if
+					end if
 				case(InletBoundary)
 					phi_f = ss%phi_f(face_idx)
 					! Fixed-value inlet: include incoming convective flux in the
@@ -4860,7 +4997,7 @@ function triangleCentroid(points)
 				if (fn_m < 1.0d-30) cycle
 				
 				select case(bcs(b)%type)
-				case(wallBoundary, emptyBoundary)
+				case(wallBoundary, movingWallBoundary, emptyBoundary)
 					ss%phi_f(face_idx) = 0.0d0
 				case(InletBoundary)
 					ss%phi_f(face_idx) = rho * dot_product(U_in, fn)
@@ -5235,11 +5372,11 @@ function triangleCentroid(points)
 		type(BoundaryCondition), intent(in) :: bcs(:)
 		type(Fluidd), intent(in) :: fluid
 		integer :: b, fi, face_idx, oc
-		real(kind=8) :: rho, y, speed, u_tau, omega_wall, mu_t_wall
+		real(kind=8) :: rho, y, speed, u_tau, omega_wall, mu_t_wall, U_wall(3)
 
 		rho = ss%rho_ref
 		do b = 1, min(ss%nBoundaries, size(bcs))
-			if (bcs(b)%type /= wallBoundary) cycle
+			if (bcs(b)%type /= wallBoundary .and. bcs(b)%type /= movingWallBoundary) cycle
 			do fi = 1, size(mesh%boundaryFaces, 2)
 				face_idx = mesh%boundaryFaces(b, fi)
 				if (face_idx == 0) exit
@@ -5248,7 +5385,12 @@ function triangleCentroid(points)
 				if (oc<1 .or. oc>ss%nCells) cycle
 				y = max(mag(mesh%fCenters(face_idx,:)-mesh%cCenters(oc,:)), 1.0d-8)
 				if (allocated(mesh%wallDistance)) y = max(min(y, mesh%wallDistance(oc)), 1.0d-8)
-				speed = sqrt(ss%u(oc)**2 + ss%v(oc)**2 + ss%w(oc)**2)
+				U_wall = 0.0d0
+				if (bcs(b)%type == movingWallBoundary .and. allocated(bcs(b)%params)) then
+					if (size(bcs(b)%params) >= 3) U_wall = bcs(b)%params(1:3)
+				end if
+				speed = sqrt((ss%u(oc)-U_wall(1))**2 + (ss%v(oc)-U_wall(2))**2 + &
+				             (ss%w(oc)-U_wall(3))**2)
 				u_tau = sqrt(max(fluid%mu_laminar * speed / (rho * y), SMALL_NUM))
 				omega_wall = max(6.0d0 * fluid%mu_laminar / (rho * max(BETA,SMALL_NUM) * y*y), &
 				                 u_tau / max(sqrt(BETA_STAR) * KAPPA * y, 1.0d-12))
