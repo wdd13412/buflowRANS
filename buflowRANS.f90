@@ -56,7 +56,7 @@ module BuFlowModule
     real(kind=8), parameter :: SIMPLEC_D_DIAG_FLOOR = 0.5d0
     real(kind=8), parameter :: SIMPLEC_RC_DAMPING = 0.3d0
     real(kind=8), parameter :: SIMPLEC_MAX_PRESSURE_STEP_FACTOR = 0.001d0
-    real(kind=8), parameter :: SIMPLEC_WALL_DIFFUSION_BOOST = 5.0d0
+    real(kind=8), parameter :: SIMPLEC_WALL_DIFFUSION_BOOST = 1.0d0
     real(kind=8), parameter :: SIMPLEC_NONORTH_CORRECTION = 1.0d0
     real(kind=8), parameter :: SIMPLEC_OUTLET_PRESSURE_RELAX = 0.05d0
     real(kind=8), parameter :: SIMPLE_MAX_SPEED = 17.0d0
@@ -4523,18 +4523,21 @@ function triangleCentroid(points)
 			w_old = ss%w
 			p_old = ss%p
 			
-			! 更新湍流粘性，并对壁面相邻单元施加粗网格壁函数约束
+			! 更新湍流粘性。这里不再额外施加强制壁函数/壁面扩散增强，
+			! 避免把车身速度亏损人为压缩到第一层单元。
 			do c = 1, ss%nCells
 				ss%mu_t(c) = rho * max(ss%k(c),SMALL_NUM) / max(ss%omega(c),SMALL_NUM)
 				ss%mu_t(c) = min(ss%mu_t(c), 1.0d4 * ss%mu_l(c))
 			end do
-			call simple_apply_wall_functions(mesh, ss, boundaryConditions, fluid)
 			
 			! 步骤1：求解动量方程
 			call simplec_momentum(mesh, ss, boundaryConditions, fluid, U_init)
 			
 			! 步骤2：压力修正 + 更新面通量和速度
 			call simplec_pressure(mesh, ss, boundaryConditions, U_init)
+			! 固定速度入口应保持入口相邻控制体接近来流速度，
+			! 防止压力修正把入口第一列单元拉成非物理低速带。
+			call simple_enforce_inlet_velocity(mesh, ss, boundaryConditions, U_init)
 			
 			! 步骤3：全局质量修正
 			call simple2_mass_fix(mesh, ss, boundaryConditions, rho, U_init)
@@ -5042,7 +5045,7 @@ function triangleCentroid(points)
 		integer :: c, b, fi, face_idx, oc, pmin_cell, pmax_cell, umax_cell, nFacesB
 		integer :: n_wall, n_front, n_roof, n_rear, n_wake, n_upstream
 		real(kind=8) :: speed, pmin_val, pmax_val, umax_val, p_range
-		real(kind=8) :: b_pmin, b_pmax, b_psum, b_umax, b_flux
+		real(kind=8) :: b_pmin, b_pmax, b_psum, b_umin, b_umax, b_usum, b_flux
 		real(kind=8) :: v_abs_max, v_rms, x_min, x_max, y_min, y_max, xw_min, xw_max, yw_min, yw_max
 		real(kind=8) :: wall_dx, wall_dy, front_p, roof_p, rear_p, wake_u, upstream_u, wake_deficit
 		logical, allocatable :: wall_cell(:)
@@ -5084,8 +5087,8 @@ function triangleCentroid(points)
 		end if
 
 		do b = 1, min(ss%nBoundaries, size(bcs))
-			nFacesB = 0; b_psum = 0.0d0; b_umax = 0.0d0; b_flux = 0.0d0
-			b_pmin = huge(1.0d0); b_pmax = -huge(1.0d0)
+			nFacesB = 0; b_psum = 0.0d0; b_usum = 0.0d0; b_umax = 0.0d0; b_flux = 0.0d0
+			b_pmin = huge(1.0d0); b_pmax = -huge(1.0d0); b_umin = huge(1.0d0)
 			bname = 'boundary'
 			if (allocated(mesh%boundaryNames) .and. b <= size(mesh%boundaryNames)) then
 				bname = trim(adjustl(mesh%boundaryNames(b)))
@@ -5100,13 +5103,15 @@ function triangleCentroid(points)
 				b_psum = b_psum + ss%p(oc)
 				b_pmin = min(b_pmin, ss%p(oc)); b_pmax = max(b_pmax, ss%p(oc))
 				speed = sqrt(ss%u(oc)**2 + ss%v(oc)**2 + ss%w(oc)**2)
-				b_umax = max(b_umax, speed)
+				b_umin = min(b_umin, speed); b_umax = max(b_umax, speed)
+				b_usum = b_usum + speed
 				b_flux = b_flux + ss%phi_f(face_idx)
 			end do
 			if (nFacesB > 0) then
-				write(*,'(A,I2,1X,A,A,ES11.3,A,ES11.3,A,ES11.3,A,F8.3,A,ES11.3)') &
+				write(*,'(A,I2,1X,A,A,ES11.3,A,ES11.3,A,ES11.3,A,F8.3,A,F8.3,A,F8.3,A,ES11.3)') &
 					'    bc', b, trim(bname), ' pAvg=', b_psum/dble(nFacesB), &
-					' pMin=', b_pmin, ' pMax=', b_pmax, ' uMax=', b_umax, ' flux=', b_flux
+					' pMin=', b_pmin, ' pMax=', b_pmax, ' uMin=', b_umin, &
+					' uAvg=', b_usum/dble(nFacesB), ' uMax=', b_umax, ' flux=', b_flux
 			end if
 		end do
 
@@ -5225,6 +5230,33 @@ function triangleCentroid(points)
 			end if
 		end if
 	end subroutine simple2_mass_fix
+
+
+!-----------------------------------------------------------------------
+! 固定速度入口约束：用于消除入口相邻单元的非物理低速带
+!-----------------------------------------------------------------------
+	subroutine simple_enforce_inlet_velocity(mesh, ss, bcs, U_in)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(inout) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		real(kind=8), intent(in) :: U_in(3)
+		integer :: b, fi, face_idx, oc
+
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			if (bcs(b)%type /= InletBoundary) cycle
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx<1 .or. face_idx>ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1)
+				if (oc<1 .or. oc>ss%nCells) cycle
+				ss%u(oc) = U_in(1)
+				ss%v(oc) = U_in(2)
+				ss%w(oc) = U_in(3)
+			end do
+		end do
+	end subroutine simple_enforce_inlet_velocity
 
 !-----------------------------------------------------------------------
 ! 粗网格壁函数/近壁约束：对 wall 相邻单元设置 omega 下限并阻尼 mu_t

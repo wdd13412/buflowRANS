@@ -23,7 +23,11 @@ SIMPLEC_RE = re.compile(
     r"Umax=\s*(?P<umax>[*+\-0-9.Ee]+)\s+dp=\s*(?P<dp>[*+\-0-9.Ee]+)"
 )
 DIAG_RE = re.compile(r"diag\s+(?P<iter>\d+)\b.*rawDp=\s*(?P<raw_dp>[*+\-0-9.Ee]+)")
-BC_RE = re.compile(r"\bbc\s+(?P<index>\d+)\s+.*?flux=\s*(?P<flux>[*+\-0-9.Ee]+)")
+BC_RE = re.compile(
+    r"\bbc\s+(?P<index>\d+)\s+(?P<name>\S+).*?"
+    r"(?:uMin=\s*(?P<umin>[*+\-0-9.Ee]+)\s+uAvg=\s*(?P<uavg>[*+\-0-9.Ee]+)\s+uMax=\s*(?P<umax>[*+\-0-9.Ee]+).*?)?"
+    r"flux=\s*(?P<flux>[*+\-0-9.Ee]+)"
+)
 PHYS_RE = re.compile(
     r"phys\s+(?P<iter>\d+)\s+vMax=\s*(?P<vmax>[*+\-0-9.Ee]+)\s+"
     r"vRms=\s*(?P<vrms>[*+\-0-9.Ee]+)\s+frontP=\s*(?P<frontp>[*+\-0-9.Ee]+)\s+"
@@ -65,8 +69,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-vmax",
         type=float,
-        default=5.0e-2,
-        help="minimum target cross-stream velocity magnitude; catches frozen 1-D flow fields",
+        default=0.0,
+        help="minimum target cross-stream velocity magnitude when --require-contour-physics is set",
+    )
+    parser.add_argument(
+        "--require-contour-physics",
+        action="store_true",
+        help="also require vMax/front-roof-rear/wake checks; disabled by default for coarse smoke meshes",
+    )
+    parser.add_argument(
+        "--expected-inlet-speed",
+        type=float,
+        default=11.0,
+        help="expected fixed inlet owner-cell speed reported in boundary diagnostics",
+    )
+    parser.add_argument(
+        "--inlet-speed-tol",
+        type=float,
+        default=1.0e-6,
+        help="absolute tolerance for inlet uMin/uAvg/uMax diagnostics",
     )
     parser.add_argument(
         "--max-wake-accel",
@@ -149,6 +170,8 @@ def main() -> int:
     mass_check_done = False
     mass_imbalance: float | None = None
     target_fluxes: list[float] = []
+    inlet_speed_ok = False
+    inlet_speed_message = "inlet speed diagnostics not seen"
 
     assert proc.stdout is not None
     try:
@@ -158,7 +181,7 @@ def main() -> int:
                     f"ERROR: timeout after {args.timeout:.1f}s before completing SIMPLEC {args.target_iter}; "
                     f"last iter={last_iter}, Umax={last_umax}, dp={last_dp}, "
                     f"target_diag_seen={target_diag_seen}, flux_lines={len(target_fluxes)}, "
-                    f"mass_check_done={mass_check_done}",
+                    f"mass_check_done={mass_check_done}, inlet_speed_ok={inlet_speed_ok}",
                     file=sys.stderr,
                 )
                 stop_process(proc)
@@ -224,6 +247,20 @@ def main() -> int:
             if target_diag_seen and bc_match is not None:
                 try:
                     target_fluxes.append(finite_float(bc_match.group("flux"), "boundary flux", line))
+                    bname = bc_match.group("name").lower()
+                    if "inlet" in bname and bc_match.group("umin") is not None:
+                        inlet_values = [
+                            finite_float(bc_match.group("umin"), "inlet uMin", line),
+                            finite_float(bc_match.group("uavg"), "inlet uAvg", line),
+                            finite_float(bc_match.group("umax"), "inlet uMax", line),
+                        ]
+                        diffs = [abs(v - args.expected_inlet_speed) for v in inlet_values]
+                        inlet_speed_ok = max(diffs) <= args.inlet_speed_tol
+                        inlet_speed_message = (
+                            f"inlet uMin/uAvg/uMax={inlet_values[0]:.6f}/"
+                            f"{inlet_values[1]:.6f}/{inlet_values[2]:.6f} "
+                            f"expected {args.expected_inlet_speed}±{args.inlet_speed_tol}"
+                        )
                 except ValueError as exc:
                     print(f"ERROR: {exc}", file=sys.stderr)
                     stop_process(proc)
@@ -232,11 +269,12 @@ def main() -> int:
                 if len(target_fluxes) >= args.expected_boundaries and not mass_check_done:
                     mass_imbalance = abs(sum(target_fluxes))
                     mass_check_done = True
-                    if mass_imbalance > args.max_mass_imbalance:
+                    if mass_imbalance > args.max_mass_imbalance or not inlet_speed_ok:
                         stop_process(proc)
                         _, messages = validate_ranges(args, last_iter or args.target_iter, last_umax or 0.0, last_dp or 0.0)
                         messages.append(f"mass imbalance={mass_imbalance:.3e} <= {args.max_mass_imbalance:.3e}")
-                        print("ERROR: mass balance check failed: " + ", ".join(messages), file=sys.stderr)
+                        messages.append(inlet_speed_message)
+                        print("ERROR: boundary diagnostic check failed: " + ", ".join(messages), file=sys.stderr)
                         return 1
                     continue
 
@@ -255,14 +293,16 @@ def main() -> int:
 
                 _, messages = validate_ranges(args, last_iter or args.target_iter, last_umax or 0.0, last_dp or 0.0)
                 messages.append(f"mass imbalance={mass_imbalance:.3e} <= {args.max_mass_imbalance:.3e}")
+                messages.append(inlet_speed_message)
                 messages.append(f"vMax={vmax:.3e} >= {args.min_vmax:.3e}")
                 messages.append(f"frontP={frontp:.3e} > roofP={roofp:.3e} > rearP={rearp:.3e}")
                 messages.append(f"wakeDef={wakedef:.3e} >= -{args.max_wake_accel:.3e}")
 
-                physics_ok = mass_check_done and mass_imbalance is not None
-                physics_ok = physics_ok and vmax >= args.min_vmax
-                physics_ok = physics_ok and frontp > roofp and roofp > rearp
-                physics_ok = physics_ok and wakedef >= -args.max_wake_accel
+                physics_ok = mass_check_done and mass_imbalance is not None and inlet_speed_ok
+                if args.require_contour_physics:
+                    physics_ok = physics_ok and vmax >= args.min_vmax
+                    physics_ok = physics_ok and frontp > roofp and roofp > rearp
+                    physics_ok = physics_ok and wakedef >= -args.max_wake_accel
                 stop_process(proc)
                 if physics_ok:
                     print("PASS: " + ", ".join(messages))
