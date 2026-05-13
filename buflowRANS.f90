@@ -65,6 +65,14 @@ module BuFlowModule
     real(kind=8), parameter :: SIMPLE_INLET_BUFFER_WIDTH_CELLS = 8.0d0
     real(kind=8), parameter :: SIMPLEC_WALL_MU_T_FLOOR_FACTOR = 80.0d0
     real(kind=8), parameter :: SIMPLEC_WALL_MU_T_CAP_FACTOR = 1000.0d0
+    ! SIMPLEC controlled experiments for car-mesh contour regression.
+    ! 0: current equation-level solver, no global clipping.
+    ! 1: reproduce buflowRANS4 post-processing: x-gradient-only + global p/U bounds + flux rebuild.
+    ! 2: keep current equations but rebuild face fluxes after velocity correction, without p/U clipping.
+    integer, parameter :: SIMPLEC_EXPERIMENT_CURRENT = 0
+    integer, parameter :: SIMPLEC_EXPERIMENT_BUFLOW4_BOUNDS = 1
+    integer, parameter :: SIMPLEC_EXPERIMENT_FLUX_REBUILD_ONLY = 2
+    integer, parameter :: SIMPLEC_EXPERIMENT_MODE = SIMPLEC_EXPERIMENT_BUFLOW4_BOUNDS
     logical, parameter :: DEBUG_MESH_VERBOSE = .false.
     !===========================================================================
     
@@ -4517,6 +4525,16 @@ function triangleCentroid(points)
 		write(*,'(A,F8.4,A,F6.2)') '  rho=', rho, '  U_ref=', mag(U_init)
 		write(*,'(A,F8.2,A)') '  动压=', 0.5d0*rho*mag(U_init)**2, ' Pa'
 		print *, ''
+		select case (SIMPLEC_EXPERIMENT_MODE)
+		case (SIMPLEC_EXPERIMENT_BUFLOW4_BOUNDS)
+			print *, ' SIMPLEC experiment: buflowRANS4 bounds (x-gradient + p/U clipping + flux rebuild)'
+		case (SIMPLEC_EXPERIMENT_FLUX_REBUILD_ONLY)
+			print *, ' SIMPLEC experiment: flux rebuild only (no global clipping)'
+		case default
+			print *, ' SIMPLEC experiment: current equation-level solver (no global clipping)'
+		end select
+		call flush(6)
+		print *, ''
 		
 		output_count = 0
 		
@@ -4536,11 +4554,20 @@ function triangleCentroid(points)
 			! 步骤1：求解动量方程
 			call simplec_momentum(mesh, ss, boundaryConditions, fluid, U_init)
 			
-			! 步骤2：压力修正 + 更新面通量和速度
+			! 步骤2：压力修正 + 可控后处理实验
 			call simplec_pressure(mesh, ss, boundaryConditions, U_init)
-			! 固定速度入口应保持入口相邻控制体接近来流速度，
-			! 防止压力修正把入口第一列单元拉成非物理低速带。
-			call simple_enforce_inlet_velocity(mesh, ss, boundaryConditions, U_init)
+			select case (SIMPLEC_EXPERIMENT_MODE)
+			case (SIMPLEC_EXPERIMENT_BUFLOW4_BOUNDS)
+				! buflowRANS4 对照实验：全场 p/U bounded 后处理，并重建面通量。
+				call simplec_apply_low_mach_bounds(mesh, ss, boundaryConditions, U_init)
+			case (SIMPLEC_EXPERIMENT_FLUX_REBUILD_ONLY)
+				! 只测试“速度修正后重建面通量”是否改善云图，不裁剪 p/U。
+				call simple_enforce_inlet_velocity(mesh, ss, boundaryConditions, U_init)
+				call simplec_rebuild_face_fluxes(mesh, ss, boundaryConditions, U_init)
+			case default
+				! 当前方程层求解器：只保留入口缓冲，避免入口低速带。
+				call simple_enforce_inlet_velocity(mesh, ss, boundaryConditions, U_init)
+			end select
 			
 			! 步骤3：全局质量修正
 			call simple2_mass_fix(mesh, ss, boundaryConditions, rho, U_init)
@@ -4621,12 +4648,16 @@ function triangleCentroid(points)
 		allocate(tg(ss%nCells, 1, 3))
 		tg = greenGaussGrad_RANS(mesh, pm, .false.)
 		allocate(gP(ss%nCells, 3))
-		! Use the full pressure gradient in SIMPLEC momentum.  The previous
-		! streamwise-only approximation kept v nearly frozen and produced
-		! contour plots dominated by a one-dimensional pressure ramp.
-		gP(:,1) = tg(:,1,1)
-		gP(:,2) = tg(:,1,2)
-		gP(:,3) = tg(:,1,3)
+		if (SIMPLEC_EXPERIMENT_MODE == SIMPLEC_EXPERIMENT_BUFLOW4_BOUNDS) then
+			! buflowRANS4 对照：只使用流向压力梯度。
+			gP = 0.0d0
+			gP(:,1) = tg(:,1,1)
+		else
+			! 当前方程层模型：完整三维压力梯度。
+			gP(:,1) = tg(:,1,1)
+			gP(:,2) = tg(:,1,2)
+			gP(:,3) = tg(:,1,3)
+		end if
 		deallocate(tg, pm)
 		
 		aP = 0.0d0; bU = 0.0d0; bV = 0.0d0; bW = 0.0d0
@@ -4796,11 +4827,16 @@ function triangleCentroid(points)
 		allocate(tg(ss%nCells, 1, 3))
 		tg = greenGaussGrad_RANS(mesh, pm, .false.)
 		allocate(gP(ss%nCells, 3))
-		! Rhie-Chow interpolation must use the same full pressure gradient as
-		! the momentum equation to suppress checkerboard modes in every direction.
-		gP(:,1) = tg(:,1,1)
-		gP(:,2) = tg(:,1,2)
-		gP(:,3) = tg(:,1,3)
+		if (SIMPLEC_EXPERIMENT_MODE == SIMPLEC_EXPERIMENT_BUFLOW4_BOUNDS) then
+			! buflowRANS4 对照：Rhie-Chow 也只使用流向压力梯度。
+			gP = 0.0d0
+			gP(:,1) = tg(:,1,1)
+		else
+			! 当前方程层模型：Rhie-Chow 使用完整三维压力梯度。
+			gP(:,1) = tg(:,1,1)
+			gP(:,2) = tg(:,1,2)
+			gP(:,3) = tg(:,1,3)
+		end if
 		deallocate(tg, pm)
 		
 		aP_pp = 0.0d0; src = 0.0d0
@@ -4913,10 +4949,16 @@ function triangleCentroid(points)
 		allocate(tg(ss%nCells, 1, 3))
 		tg = greenGaussGrad_RANS(mesh, pm, .false.)
 		allocate(gPp(ss%nCells, 3))
-		! Correct every velocity component with the full pressure-correction gradient.
-		gPp(:,1) = tg(:,1,1)
-		gPp(:,2) = tg(:,1,2)
-		gPp(:,3) = tg(:,1,3)
+		if (SIMPLEC_EXPERIMENT_MODE == SIMPLEC_EXPERIMENT_BUFLOW4_BOUNDS) then
+			! buflowRANS4 对照：只用流向压力修正梯度修正速度。
+			gPp = 0.0d0
+			gPp(:,1) = tg(:,1,1)
+		else
+			! 当前方程层模型：完整三维压力修正梯度。
+			gPp(:,1) = tg(:,1,1)
+			gPp(:,2) = tg(:,1,2)
+			gPp(:,3) = tg(:,1,3)
+		end if
 		deallocate(tg, pm)
 		
 		! 速度修正：用未松弛的 aP_u
@@ -4960,6 +5002,90 @@ function triangleCentroid(points)
 		
 		deallocate(gP, gPp)
 	end subroutine simplec_pressure
+
+
+!-----------------------------------------------------------------------
+! SIMPLEC controlled post-processing experiment: reproduce buflowRANS4 bounds.
+! This mode is for isolating the contour regression only.  It deliberately
+! clips pressure/velocity and then rebuilds fluxes, so it is not the final
+! high-fidelity CFD formulation.
+!-----------------------------------------------------------------------
+	subroutine simplec_apply_low_mach_bounds(mesh, ss, bcs, U_in)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(inout) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		real(kind=8), intent(in) :: U_in(3)
+		integer :: c
+		real(kind=8) :: speed, scale_fac, p_mean, p_range
+
+		p_mean = sum(ss%p) / dble(ss%nCells)
+		ss%p = ss%p - p_mean
+		p_range = maxval(ss%p) - minval(ss%p)
+		if (p_range > SIMPLE_MAX_PRESSURE_RANGE) then
+			ss%p = ss%p * (SIMPLE_MAX_PRESSURE_RANGE / p_range)
+		end if
+
+		do c = 1, ss%nCells
+			speed = sqrt(ss%u(c)**2 + ss%v(c)**2 + ss%w(c)**2)
+			if (speed > SIMPLE_MAX_SPEED) then
+				scale_fac = SIMPLE_MAX_SPEED / max(speed, SMALL_NUM)
+				ss%u(c) = ss%u(c) * scale_fac
+				ss%v(c) = ss%v(c) * scale_fac
+				ss%w(c) = ss%w(c) * scale_fac
+			end if
+		end do
+
+		call simplec_rebuild_face_fluxes(mesh, ss, bcs, U_in)
+	end subroutine simplec_apply_low_mach_bounds
+
+
+!-----------------------------------------------------------------------
+! Rebuild face mass fluxes from the current cell velocity field.
+! Used to distinguish whether buflowRANS4's behavior comes from clipping
+! itself or from making phi consistent with the post-correction velocity.
+!-----------------------------------------------------------------------
+	subroutine simplec_rebuild_face_fluxes(mesh, ss, bcs, U_in)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(inout) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		real(kind=8), intent(in) :: U_in(3)
+		integer :: f, b, fi, face_idx, oc, nc, nInt
+		real(kind=8) :: rho, fv(3)
+
+		rho = ss%rho_ref
+		nInt = ss%nFaces - ss%nBdryFaces
+
+		do f = 1, nInt
+			oc = mesh%faces(f,1); nc = mesh%faces(f,2)
+			if (oc<1.or.oc>ss%nCells.or.nc<1.or.nc>ss%nCells) cycle
+			fv(1) = 0.5d0*(ss%u(oc)+ss%u(nc))
+			fv(2) = 0.5d0*(ss%v(oc)+ss%v(nc))
+			fv(3) = 0.5d0*(ss%w(oc)+ss%w(nc))
+			ss%phi_f(f) = rho * dot_product(fv, mesh%fAVecs(f,:))
+		end do
+
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx<1.or.face_idx>ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1)
+				if (oc<1.or.oc>ss%nCells) cycle
+				select case(bcs(b)%type)
+				case(wallBoundary, emptyBoundary)
+					ss%phi_f(face_idx) = 0.0d0
+				case(InletBoundary)
+					ss%phi_f(face_idx) = rho * dot_product(U_in, mesh%fAVecs(face_idx,:))
+				case(OutletBoundary)
+					fv = (/ss%u(oc), ss%v(oc), ss%w(oc)/)
+					ss%phi_f(face_idx) = rho * dot_product(fv, mesh%fAVecs(face_idx,:))
+				end select
+			end do
+		end do
+	end subroutine simplec_rebuild_face_fluxes
+
 
 !-----------------------------------------------------------------------
 ! 对角预处理共轭梯度求解压力修正方程
