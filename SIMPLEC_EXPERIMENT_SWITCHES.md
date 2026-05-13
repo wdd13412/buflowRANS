@@ -68,6 +68,6 @@ gfortran -O2 -o buflow_run buflowRANS.f90 run_parameter.f90
 
 根据你跑图的反馈，默认 `SIMPLEC_EXPERIMENT_BUFLOW4_BOUNDS` 已能恢复较正常的速度扩散，但入口会出现高压带、出口会出现低压带。这个现象说明 `buflowRANS4` 风格的 bounded 后处理虽然能重建较平滑的速度/通量场，但没有给入口/出口远场压力足够强的表压参考。
 
-本轮在 `simplec_apply_low_mach_bounds` 内加入了 `simplec_enforce_farfield_pressure`：只把 inlet/outlet patch 相邻 owner cells 的表压设为 `0 Pa`，即大气表压。它不会全场缩放压力，也不会改车身壁面压力结构；目的只是验证入口/出口高低压带是否来自远场压力参考缺失。
+上一轮把 inlet/outlet patch 相邻 owner cells 的表压硬设为 `0 Pa`，会在入口附近制造不连续压力层；你反馈的入口分层就是这个硬锚定导致的。因此本轮改成 `simplec_remove_farfield_pressure_ramp`：计算 inlet/outlet patch 平均压力，然后沿来流方向平滑扣除一条线性压力坡度，让入口和出口平均压力接近大气表压，但不在 patch 第一层单元制造突变。
 
-如果这一步后速度云图仍保持较正常，同时入口/出口压力带消失，则说明下一步要把入口/出口远场压力条件写成方程级边界条件，而不是只做后处理。
+如果这一步后速度云图仍保持较正常，同时入口/出口压力带减弱或消失，则说明下一步要把入口/出口远场压力条件写成方程级边界条件；如果仍然有入口低速带，则问题不在单个入口 owner cell，而在入口到车身之间的压力/通量耦合。

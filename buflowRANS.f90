@@ -5037,38 +5037,70 @@ function triangleCentroid(points)
 		end do
 
 		! 外部汽车低速算例中，入口和出口远场压力都应接近表压 0。
-		! buflowRANS4 风格的速度/压力 bounded 后处理会保留全场压力坡度，
-		! 导致入口高压带、出口低压带；这里仅把 inlet/outlet patch
-		! 相邻单元锚定到大气表压，用于隔离远场压力参考问题。
-		call simplec_enforce_farfield_pressure(mesh, ss, bcs)
+		! 不要把 patch owner 单元硬设为 0，否则会产生入口分层/竖条。
+		! 这里改为平滑移除 inlet-outlet 平均压力坡度，只校正远场
+		! 参考压力，不在局部制造压力不连续。
+		call simplec_remove_farfield_pressure_ramp(mesh, ss, bcs, U_in)
 		call simplec_rebuild_face_fluxes(mesh, ss, bcs, U_in)
 	end subroutine simplec_apply_low_mach_bounds
 
 
 !-----------------------------------------------------------------------
-! Keep inlet/outlet farfield pressure at atmospheric gauge pressure.
-! This is intentionally limited to inlet/outlet patch-adjacent owner cells so
-! wall/car pressure structures are not globally clipped or rescaled.
+! Smooth farfield gauge correction for external-flow experiments.
+! It subtracts a linear pressure ramp between the average inlet and outlet
+! patch pressures, so both farfield ends approach gauge 0 without creating
+! a discontinuous pressure layer next to the inlet/outlet patches.
 !-----------------------------------------------------------------------
-	subroutine simplec_enforce_farfield_pressure(mesh, ss, bcs)
+	subroutine simplec_remove_farfield_pressure_ramp(mesh, ss, bcs, U_in)
 		implicit none
 		type(Meshh), intent(in) :: mesh
 		type(SIMPLEState), intent(inout) :: ss
 		type(BoundaryCondition), intent(in) :: bcs(:)
-		integer :: b, fi, face_idx, oc
+		real(kind=8), intent(in) :: U_in(3)
+		integer :: b, fi, face_idx, oc, c, nInlet, nOutlet
+		real(kind=8) :: U_mag, eU(3), pIn, pOut, sIn, sOut, sCell, t, ramp
+
+		U_mag = max(mag(U_in), 1.0d-12)
+		eU = U_in / U_mag
+		pIn = 0.0d0; pOut = 0.0d0
+		sIn = 0.0d0; sOut = 0.0d0
+		nInlet = 0; nOutlet = 0
 
 		do b = 1, min(ss%nBoundaries, size(bcs))
-			if (bcs(b)%type /= InletBoundary .and. bcs(b)%type /= OutletBoundary) cycle
 			do fi = 1, size(mesh%boundaryFaces, 2)
 				face_idx = mesh%boundaryFaces(b, fi)
 				if (face_idx == 0) exit
 				if (face_idx<1.or.face_idx>ss%nFaces) cycle
 				oc = mesh%faces(face_idx, 1)
 				if (oc<1.or.oc>ss%nCells) cycle
-				ss%p(oc) = 0.0d0
+				select case (bcs(b)%type)
+				case (InletBoundary)
+					pIn = pIn + ss%p(oc)
+					sIn = sIn + dot_product(mesh%cCenters(oc,:), eU)
+					nInlet = nInlet + 1
+				case (OutletBoundary)
+					pOut = pOut + ss%p(oc)
+					sOut = sOut + dot_product(mesh%cCenters(oc,:), eU)
+					nOutlet = nOutlet + 1
+				end select
 			end do
 		end do
-	end subroutine simplec_enforce_farfield_pressure
+
+		if (nInlet <= 0 .or. nOutlet <= 0) return
+		pIn = pIn / dble(nInlet)
+		pOut = pOut / dble(nOutlet)
+		sIn = sIn / dble(nInlet)
+		sOut = sOut / dble(nOutlet)
+		if (abs(sOut - sIn) < 1.0d-12) return
+
+		do c = 1, ss%nCells
+			sCell = dot_product(mesh%cCenters(c,:), eU)
+			t = (sCell - sIn) / (sOut - sIn)
+			t = max(0.0d0, min(1.0d0, t))
+			ramp = (1.0d0 - t) * pIn + t * pOut
+			ss%p(c) = ss%p(c) - ramp
+		end do
+	end subroutine simplec_remove_farfield_pressure_ramp
 
 
 !-----------------------------------------------------------------------
