@@ -63,3 +63,11 @@ gfortran -O2 -o buflow_run buflowRANS.f90 run_parameter.f90
 - `dp ≈ 34 Pa`
 
 这说明当前代码的 bounded 后处理能压住速度，但因为当前方程层已经不同于 `buflowRANS4.f90`，压力范围没有自然增长到 200 Pa；这正是下一步需要通过模式 2/0 区分的重点。
+
+## 入口/出口压力带说明
+
+根据你跑图的反馈，默认 `SIMPLEC_EXPERIMENT_BUFLOW4_BOUNDS` 已能恢复较正常的速度扩散，但入口会出现高压带、出口会出现低压带。这个现象说明 `buflowRANS4` 风格的 bounded 后处理虽然能重建较平滑的速度/通量场，但没有给入口/出口远场压力足够强的表压参考。
+
+本轮在 `simplec_apply_low_mach_bounds` 内加入了 `simplec_enforce_farfield_pressure`：只把 inlet/outlet patch 相邻 owner cells 的表压设为 `0 Pa`，即大气表压。它不会全场缩放压力，也不会改车身壁面压力结构；目的只是验证入口/出口高低压带是否来自远场压力参考缺失。
+
+如果这一步后速度云图仍保持较正常，同时入口/出口压力带消失，则说明下一步要把入口/出口远场压力条件写成方程级边界条件，而不是只做后处理。

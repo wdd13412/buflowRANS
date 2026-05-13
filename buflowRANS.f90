@@ -5036,8 +5036,39 @@ function triangleCentroid(points)
 			end if
 		end do
 
+		! 外部汽车低速算例中，入口和出口远场压力都应接近表压 0。
+		! buflowRANS4 风格的速度/压力 bounded 后处理会保留全场压力坡度，
+		! 导致入口高压带、出口低压带；这里仅把 inlet/outlet patch
+		! 相邻单元锚定到大气表压，用于隔离远场压力参考问题。
+		call simplec_enforce_farfield_pressure(mesh, ss, bcs)
 		call simplec_rebuild_face_fluxes(mesh, ss, bcs, U_in)
 	end subroutine simplec_apply_low_mach_bounds
+
+
+!-----------------------------------------------------------------------
+! Keep inlet/outlet farfield pressure at atmospheric gauge pressure.
+! This is intentionally limited to inlet/outlet patch-adjacent owner cells so
+! wall/car pressure structures are not globally clipped or rescaled.
+!-----------------------------------------------------------------------
+	subroutine simplec_enforce_farfield_pressure(mesh, ss, bcs)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(inout) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		integer :: b, fi, face_idx, oc
+
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			if (bcs(b)%type /= InletBoundary .and. bcs(b)%type /= OutletBoundary) cycle
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx<1.or.face_idx>ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1)
+				if (oc<1.or.oc>ss%nCells) cycle
+				ss%p(oc) = 0.0d0
+			end do
+		end do
+	end subroutine simplec_enforce_farfield_pressure
 
 
 !-----------------------------------------------------------------------
