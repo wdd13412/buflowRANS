@@ -43,15 +43,29 @@ module BuFlowModule
     !===========================================================================
     ! SIMPLE solver parameters
     !===========================================================================
-    real(kind=8), parameter :: SIMPLE_ALPHA_U = 0.5d0
+    real(kind=8), parameter :: SIMPLE_ALPHA_U = 0.20d0
     real(kind=8), parameter :: SIMPLE_ALPHA_P = 0.02d0
     real(kind=8), parameter :: SIMPLE_ALPHA_K = 0.5d0
     real(kind=8), parameter :: SIMPLE_ALPHA_OMEGA = 0.5d0
     integer, parameter :: SIMPLE_MAX_ITER = 3000
     integer, parameter :: SIMPLE_MAX_INNER_U = 10
-    integer, parameter :: SIMPLE_MAX_INNER_P = 200
+    integer, parameter :: SIMPLE_MAX_INNER_P = 1000
     real(kind=8), parameter :: SIMPLE_TOLERANCE = 1.0d-6
+    real(kind=8), parameter :: SIMPLE_PCG_TOLERANCE = 1.0d-10
+    real(kind=8), parameter :: SIMPLEC_PSEUDO_CFL = 1.0d0
+    real(kind=8), parameter :: SIMPLEC_D_DIAG_FLOOR = 0.5d0
+    real(kind=8), parameter :: SIMPLEC_RC_DAMPING = 0.3d0
+    real(kind=8), parameter :: SIMPLEC_MAX_PRESSURE_STEP_FACTOR = 0.001d0
+    real(kind=8), parameter :: SIMPLEC_WALL_DIFFUSION_BOOST = 1.0d0
+    real(kind=8), parameter :: SIMPLEC_NONORTH_CORRECTION = 1.0d0
+    real(kind=8), parameter :: SIMPLEC_OUTLET_PRESSURE_RELAX = 0.05d0
+    real(kind=8), parameter :: SIMPLE_MAX_SPEED = 17.0d0
+    real(kind=8), parameter :: SIMPLE_MAX_PRESSURE_RANGE = 200.0d0
     integer, parameter :: SIMPLE_OUTPUT_INTERVAL = 50
+    real(kind=8), parameter :: SIMPLE_INLET_BUFFER_WIDTH_CELLS = 8.0d0
+    real(kind=8), parameter :: SIMPLEC_WALL_MU_T_FLOOR_FACTOR = 80.0d0
+    real(kind=8), parameter :: SIMPLEC_WALL_MU_T_CAP_FACTOR = 1000.0d0
+    logical, parameter :: DEBUG_MESH_VERBOSE = .false.
     !===========================================================================
     
 	type Celll
@@ -93,6 +107,7 @@ module BuFlowModule
 		real(kind=8), allocatable :: fAVecs(:,:)
 		real(kind=8), allocatable :: fCenters(:,:)
 		integer(kind=8), allocatable :: boundaryFaces(:,:)
+		character(len=100), allocatable :: boundaryNames(:)
 		
 		!--- RANS k-omega: Added wall distance field ---
 		real(kind=8), allocatable :: wallDistance(:)     ! Distance from cell center to nearest wall
@@ -1409,10 +1424,9 @@ end subroutine decodePrimitives3D_RANS
 		allocate(temp_grad(nCells, 1, 3))
 		temp_grad = greenGaussGrad_RANS(mesh, P_matrix, .false.)
 		allocate(gradP(nCells, 3))
-		!gradP = temp_grad(:, :, 1)
+		! Density-based JST pressure sensor follows the original x-gradient-only form.
+		gradP = 0.0d0
 		gradP(:,1) = temp_grad(:,1,1)
-		gradP(:,2) = temp_grad(:,1,2)
-		gradP(:,3) = temp_grad(:,1,3)
 		
 		allocate(sj(nCells), sjCount(nCells))
 		sj = 0.0d0
@@ -2056,6 +2070,7 @@ function triangleCentroid(points)
 		! 判断是否为前5个面（通过第一个顶点坐标匹配）!!!!!!!!
 		is_in_first5 = .false.
 		current_face_id = 0
+		if (DEBUG_MESH_VERBOSE) then
 		do f = 1, 5
 		    ! 允许微小数值误差（1e-6）
 		    if (abs(points(1,1)-first5_refs(f,1)) < 1d-6 .and. &
@@ -2066,6 +2081,7 @@ function triangleCentroid(points)
 		        exit
 		    end if
 		end do!!!!!!!!!!!!!!!!
+		end if
 		gC = geometricCenter(points)       ! 得到整个面的几何中心
 		nPts = size(points, 1)        
 		fAVec = [0.0d0, 0.0d0, 0.0d0]      ! 初始化面面积向量
@@ -2219,6 +2235,8 @@ function triangleCentroid(points)
         nFaces = size(tempMesh%owner)
         nCells = maxval(tempMesh%owner)
         nBoundaries = size(tempMesh%boundaryNames)     
+        allocate(mesh%boundaryNames(nBoundaries))
+        mesh%boundaryNames = tempMesh%boundaryNames
         allocate(mesh%faces(nFaces, 2))
         allocate(mesh%fAVecs(nFaces, 3), mesh%fCenters(nFaces, 3))
         
@@ -2304,7 +2322,7 @@ function triangleCentroid(points)
                 end do
             end do
             ! 仅输出前两个单元的信息
-			if (c <= 2) then
+			if (DEBUG_MESH_VERBOSE .and. c <= 2) then
 			    allocate(f_list(faceCount))
 				do i = 1, faceCount
 					f_list(i) = mesh%cells(c, i)
@@ -4309,7 +4327,7 @@ function triangleCentroid(points)
 		allocate(boundaryConditions(4)%params(1))
 		boundaryConditions(4)%params(1) = P
 
-		! Symmetry (Euler/RANS 这里按 wall 方式处理，调用 updateWallBoundary_RANS)
+		! Symmetry (Euler/RANS density solver historically treats this as wall)
 		boundaryConditions(5)%type = wallBoundary
 		allocate(boundaryConditions(5)%params(0))
 		
@@ -4332,6 +4350,7 @@ function triangleCentroid(points)
 	print *, "  Number of cells: ", size(mesh%cCenters, 1)
 	print *, "  Number of faces: ", size(mesh%faces, 1)
 	print *, "  Cell volume range: ", minval(mesh%cVols), maxval(mesh%cVols)
+	call flush(6)
 
 	print *, "  P = ", P
 	print *, "  T = ", T
@@ -4341,6 +4360,8 @@ function triangleCentroid(points)
 
 		! Dispatch to selected solver
 		if (SOLVER_TYPE == SOLVER_SIMPLE) then
+			call configureBoundaryConditionsFromMesh(mesh, boundaryConditions, P, Pt, Tt, &
+			                                     UunitVec, k_init, omega_init)
 			print *, ''
 			print *, '>>> Using SIMPLE pressure-based solver (low Mach) <<<'
 			call solve_SIMPLE(mesh, meshPath, boundaryConditions, fluid, &
@@ -4352,13 +4373,81 @@ function triangleCentroid(points)
 			call solve(mesh, meshPath, cellPrimitives, boundaryConditions)
 		end if
 		
-		if (allocated(boundaryConditions)) deallocate(boundaryConditions)
+		if (allocated(boundaryConditions)) call freeBoundaryConditions(boundaryConditions)
 	end subroutine compute_CFD_RANS
 
 
 !===============================================================================
 
 !===============================================================================
+
+!-----------------------------------------------------------------------
+! 根据 OpenFOAM boundary 名称配置边界条件，避免 SIMPLEC 依赖硬编码顺序
+!-----------------------------------------------------------------------
+	subroutine configureBoundaryConditionsFromMesh(mesh, boundaryConditions, P, Pt, Tt, &
+	                                             UunitVec, k_init, omega_init)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(BoundaryCondition), allocatable, intent(inout) :: boundaryConditions(:)
+		real(kind=8), intent(in) :: P, Pt, Tt, UunitVec(3), k_init, omega_init
+		integer :: b, nBoundaries
+		character(len=100) :: bname
+
+		if (.not. allocated(mesh%boundaryNames)) return
+		nBoundaries = size(mesh%boundaryNames)
+		if (allocated(boundaryConditions)) call freeBoundaryConditions(boundaryConditions)
+		allocate(boundaryConditions(nBoundaries))
+
+		print *, 'Boundary condition mapping from OpenFOAM boundary names:'
+		do b = 1, nBoundaries
+			bname = trim(adjustl(mesh%boundaryNames(b)))
+			do while (len_trim(bname) > 0 .and. iachar(bname(1:1)) == 9)
+				bname = trim(adjustl(bname(2:)))
+			end do
+			select case (trim(bname))
+			case ('airfoil', 'car', 'wall', 'walls', 'body')
+				boundaryConditions(b)%type = wallBoundary
+				allocate(boundaryConditions(b)%params(0))
+				print *, '  ', trim(bname), ' -> wall'
+			case ('empty', 'frontAndBack')
+				boundaryConditions(b)%type = emptyBoundary
+				allocate(boundaryConditions(b)%params(0))
+				print *, '  ', trim(bname), ' -> empty/slip'
+			case ('symmetry', 'symmetryPlane')
+				! 按用户要求恢复：symmetry 与车身/壁面使用同一 wall 边界处理。
+				boundaryConditions(b)%type = wallBoundary
+				allocate(boundaryConditions(b)%params(0))
+				print *, '  ', trim(bname), ' -> wall'
+			case ('inlet', 'Inlet')
+				boundaryConditions(b)%type = InletBoundary
+				allocate(boundaryConditions(b)%params(6))
+				boundaryConditions(b)%params = [Pt, Tt, UunitVec(1), UunitVec(2), k_init, omega_init]
+				print *, '  ', trim(bname), ' -> inlet'
+			case ('outlet', 'Outlet')
+				boundaryConditions(b)%type = OutletBoundary
+				allocate(boundaryConditions(b)%params(1))
+				boundaryConditions(b)%params(1) = P
+				print *, '  ', trim(bname), ' -> outlet'
+			case default
+				boundaryConditions(b)%type = wallBoundary
+				allocate(boundaryConditions(b)%params(0))
+				print *, '  ', trim(bname), ' -> wall (default)'
+			end select
+		end do
+		call flush(6)
+	end subroutine configureBoundaryConditionsFromMesh
+
+
+	subroutine freeBoundaryConditions(boundaryConditions)
+		implicit none
+		type(BoundaryCondition), allocatable, intent(inout) :: boundaryConditions(:)
+		integer :: b
+		if (.not. allocated(boundaryConditions)) return
+		do b = 1, size(boundaryConditions)
+			if (allocated(boundaryConditions(b)%params)) deallocate(boundaryConditions(b)%params)
+		end do
+		deallocate(boundaryConditions)
+	end subroutine freeBoundaryConditions
 
 !===============================================================================
 ! SECTION 12: SIMPLEC 压力基求解器（修正D系数 + 面通量版）
@@ -4437,7 +4526,8 @@ function triangleCentroid(points)
 			w_old = ss%w
 			p_old = ss%p
 			
-			! 更新湍流粘性
+			! 更新湍流粘性。不要在这里强加近壁涡黏性下限；
+			! buflowRANS4 对照版本没有该处理，速度亏损能自然扩散到流场。
 			do c = 1, ss%nCells
 				ss%mu_t(c) = rho * max(ss%k(c),SMALL_NUM) / max(ss%omega(c),SMALL_NUM)
 				ss%mu_t(c) = min(ss%mu_t(c), 1.0d4 * ss%mu_l(c))
@@ -4447,7 +4537,10 @@ function triangleCentroid(points)
 			call simplec_momentum(mesh, ss, boundaryConditions, fluid, U_init)
 			
 			! 步骤2：压力修正 + 更新面通量和速度
-			call simplec_pressure(mesh, ss, boundaryConditions, fluid, U_init)
+			call simplec_pressure(mesh, ss, boundaryConditions, U_init)
+			! 固定速度入口应保持入口相邻控制体接近来流速度，
+			! 防止压力修正把入口第一列单元拉成非物理低速带。
+			call simple_enforce_inlet_velocity(mesh, ss, boundaryConditions, U_init)
 			
 			! 步骤3：全局质量修正
 			call simple2_mass_fix(mesh, ss, boundaryConditions, rho, U_init)
@@ -4468,6 +4561,8 @@ function triangleCentroid(points)
 					' SIMPLEC', iter, '  res(u,v,p)=', res_u, res_v, res_p, &
 					'  Umax=', maxval(sqrt(ss%u**2+ss%v**2+ss%w**2)), &
 					'  dp=', maxval(ss%p)-minval(ss%p)
+				call simplec_report_diagnostics(mesh, ss, boundaryConditions, iter)
+				call flush(6)
 			end if
 			
 			if (res_max < SIMPLE_TOLERANCE .and. iter > 50) then
@@ -4510,7 +4605,7 @@ function triangleCentroid(points)
 		integer :: c, f, b, fi, face_idx, oc, nc, gs, idx
 		integer :: nInt
 		real(kind=8) :: rho, mu_e, d_m, a_d, phi_f
-		real(kind=8) :: fn(3), fn_m, nb_s
+		real(kind=8) :: fn(3), fn_m, nb_s, h_c, a_trans
 		integer, parameter :: MNB = 30
 		real(kind=8) :: aP(ss%nCells), bU(ss%nCells), bV(ss%nCells), bW(ss%nCells)
 		real(kind=8) :: H_sum(ss%nCells)  ! 邻居系数之和，用于SIMPLEC
@@ -4526,7 +4621,12 @@ function triangleCentroid(points)
 		allocate(tg(ss%nCells, 1, 3))
 		tg = greenGaussGrad_RANS(mesh, pm, .false.)
 		allocate(gP(ss%nCells, 3))
-		gP(:,1) = tg(:,1,1); gP(:,2) = tg(:,1,2); gP(:,3) = tg(:,1,3)
+		! Use the full pressure gradient in SIMPLEC momentum.  The previous
+		! streamwise-only approximation kept v nearly frozen and produced
+		! contour plots dominated by a one-dimensional pressure ramp.
+		gP(:,1) = tg(:,1,1)
+		gP(:,2) = tg(:,1,2)
+		gP(:,3) = tg(:,1,3)
 		deallocate(tg, pm)
 		
 		aP = 0.0d0; bU = 0.0d0; bV = 0.0d0; bW = 0.0d0
@@ -4587,41 +4687,57 @@ function triangleCentroid(points)
 				
 				select case(bcs(b)%type)
 				case(wallBoundary)
-					a_d = mu_e * fn_m / d_m
+					! Coarse car meshes under-resolve the boundary layer; boost the
+					! no-slip wall diffusion so the wall momentum deficit is not confined
+					! to a single cell layer in velocity contours.
+					a_d = SIMPLEC_WALL_DIFFUSION_BOOST * mu_e * fn_m / d_m
 					aP(oc) = aP(oc) + a_d
 				case(InletBoundary)
 					phi_f = ss%phi_f(face_idx)
-					a_d = mu_e * fn_m / d_m + max(phi_f, 0.0d0)
+					! Fixed-value inlet: include incoming convective flux in the
+					! known-value source instead of treating the inlet as weak diffusion only.
+					a_d = mu_e * fn_m / d_m + max(-phi_f, 0.0d0)
 					aP(oc) = aP(oc) + a_d
 					bU(oc) = bU(oc) + a_d * U_in(1)
 					bV(oc) = bV(oc) + a_d * U_in(2)
 					bW(oc) = bW(oc) + a_d * U_in(3)
 				case(OutletBoundary)
 					phi_f = ss%phi_f(face_idx)
-					if (phi_f > 0.0d0) aP(oc) = aP(oc) + phi_f
+					if (phi_f > 0.0d0) then
+						aP(oc) = aP(oc) + phi_f
+					else
+						! Stabilise outlet backflow as a bounded known-value inflow.
+						aP(oc) = aP(oc) + max(-phi_f, 0.0d0)
+						bU(oc) = bU(oc) + max(-phi_f, 0.0d0) * U_in(1)
+						bV(oc) = bV(oc) + max(-phi_f, 0.0d0) * U_in(2)
+						bW(oc) = bW(oc) + max(-phi_f, 0.0d0) * U_in(3)
+					end if
 				case(emptyBoundary)
 					continue
 				end select
 			end do
 		end do
 		
-		! 保存原始aP（用于SIMPLEC的D系数）
-		! SIMPLEC: D = V / (aP - H) 而不是 V / aP
+		! 伪瞬态对角项只用于稳定动量预测；压力修正 D 系数继续采用
+		! aP-H/floor 的 SIMPLEC 稳定形式，防止近壁小单元产生非物理 Umax。
+		! 本轮关键回退是取消粗糙 wall mu_t floor，不再人为压住近壁扩散。
 		do c = 1, ss%nCells
-			aP(c) = max(aP(c), 1.0d-20)
-			! 标准SIMPLE：D系数用原始aP（不是aP_tilde=aP/alpha）
-			ss%aP_u(c) = aP(c)
+			h_c = max(mesh%cVols(c)**(1.0d0/3.0d0), 1.0d-8)
+			if (allocated(mesh%wallDistance)) h_c = min(h_c, max(mesh%wallDistance(c), 1.0d-8))
+			a_trans = rho * mesh%cVols(c) * max(mag(U_in), 1.0d0) / (max(SIMPLEC_PSEUDO_CFL, 1.0d-6) * h_c)
+			aP(c) = max(aP(c) + a_trans, 1.0d-20)
+			bU(c) = bU(c) + a_trans * ss%u(c)
+			bV(c) = bV(c) + a_trans * ss%v(c)
+			bW(c) = bW(c) + a_trans * ss%w(c)
+			ss%aP_u(c) = max(aP(c) - H_sum(c), SIMPLEC_D_DIAG_FLOOR * aP(c), 1.0d-20)
 		end do
 		
 		! under-relaxation：aP_tilde = aP / alpha_u
-		! 注意：GS用aP_tilde，但D系数用aP_u（SIMPLEC修正）
+		! 注意：这里不再截断历史速度，避免用人为限幅污染物理解。
 		do c = 1, ss%nCells
-			bU(c) = bU(c) + (1.0d0-SIMPLE_ALPHA_U) * (aP(c)/SIMPLE_ALPHA_U) * &
-				max(-30.0d0, min(30.0d0, ss%u(c)))
-			bV(c) = bV(c) + (1.0d0-SIMPLE_ALPHA_U) * (aP(c)/SIMPLE_ALPHA_U) * &
-				max(-30.0d0, min(30.0d0, ss%v(c)))
-			bW(c) = bW(c) + (1.0d0-SIMPLE_ALPHA_U) * (aP(c)/SIMPLE_ALPHA_U) * &
-				max(-30.0d0, min(30.0d0, ss%w(c)))
+			bU(c) = bU(c) + (1.0d0-SIMPLE_ALPHA_U) * (aP(c)/SIMPLE_ALPHA_U) * ss%u(c)
+			bV(c) = bV(c) + (1.0d0-SIMPLE_ALPHA_U) * (aP(c)/SIMPLE_ALPHA_U) * ss%v(c)
+			bW(c) = bW(c) + (1.0d0-SIMPLE_ALPHA_U) * (aP(c)/SIMPLE_ALPHA_U) * ss%w(c)
 		end do
 		
 		! GS求解（用 aP_tilde = aP/alpha_u）
@@ -4653,23 +4769,23 @@ function triangleCentroid(points)
 	end subroutine simplec_momentum
 
 !-----------------------------------------------------------------------
-! SIMPLEC 压力修正：D_f = V/(aP-H)，alpha_p=1
+! SIMPLEC 压力修正：PCG求解压力方程并保持Rhie-Chow面通量一致
 !-----------------------------------------------------------------------
-	subroutine simplec_pressure(mesh, ss, bcs, fluid, U_in)
+	subroutine simplec_pressure(mesh, ss, bcs, U_in)
 		implicit none
 		type(Meshh), intent(in) :: mesh
 		type(SIMPLEState), intent(inout) :: ss
 		type(BoundaryCondition), intent(in) :: bcs(:)
-		type(Fluidd), intent(in) :: fluid
 		real(kind=8), intent(in) :: U_in(3)
 		
-		integer :: c, f, b, fi, face_idx, oc, nc, gs, idx, nInt
-		real(kind=8) :: rho, fn(3), fn_m, d_m, D_f, flux_s, fv(3), D_c
+		integer :: c, f, b, fi, face_idx, oc, nc, nInt
+		real(kind=8) :: rho, fn(3), fn_m, d_m, d2, D_f, D_base, flux_s, fv(3), D_c
+		real(kind=8) :: dvec(3), nonorth(3), orth_coeff, grad_face_dot_area
+		real(kind=8) :: alpha_p_eff, p_step_limit, p_prime_max
 		integer, parameter :: MNB = 30
 		real(kind=8) :: aP_pp(ss%nCells), src(ss%nCells)
 		real(kind=8) :: aN_pp(ss%nCells, MNB)
 		integer :: nb_i(ss%nCells, MNB), nb_n(ss%nCells)
-		real(kind=8) :: nb_s
 		real(kind=8), allocatable :: gP(:,:), gPp(:,:), pm(:,:), tg(:,:,:)
 		
 		nInt = ss%nFaces - ss%nBdryFaces
@@ -4680,7 +4796,11 @@ function triangleCentroid(points)
 		allocate(tg(ss%nCells, 1, 3))
 		tg = greenGaussGrad_RANS(mesh, pm, .false.)
 		allocate(gP(ss%nCells, 3))
-		gP(:,1) = tg(:,1,1); gP(:,2) = tg(:,1,2); gP(:,3) = tg(:,1,3)
+		! Rhie-Chow interpolation must use the same full pressure gradient as
+		! the momentum equation to suppress checkerboard modes in every direction.
+		gP(:,1) = tg(:,1,1)
+		gP(:,2) = tg(:,1,2)
+		gP(:,3) = tg(:,1,3)
 		deallocate(tg, pm)
 		
 		aP_pp = 0.0d0; src = 0.0d0
@@ -4693,19 +4813,24 @@ function triangleCentroid(points)
 			if (oc<1.or.oc>ss%nCells.or.nc<1.or.nc>ss%nCells) cycle
 			fn = mesh%fAVecs(f,:); fn_m = mag(fn)
 			if (fn_m < 1.0d-30) cycle
-			d_m = mag(mesh%cCenters(nc,:)-mesh%cCenters(oc,:))
-			if (d_m < 1.0d-30) cycle
+			dvec = mesh%cCenters(nc,:) - mesh%cCenters(oc,:)
+			d2 = max(dot_product(dvec, dvec), 1.0d-30)
+			d_m = sqrt(d2)
+			orth_coeff = dot_product(fn, dvec) / d2
+			if (orth_coeff <= 0.0d0) orth_coeff = fn_m / d_m
+			orth_coeff = max(orth_coeff, 0.05d0 * fn_m / d_m)
+			nonorth = fn - orth_coeff * dvec
 			
-			! SIMPLEC: D_f 用 aP_u = (aP - H)，不是 aP/alpha_u
-			D_f = 0.5d0*(mesh%cVols(oc)/ss%aP_u(oc) + mesh%cVols(nc)/ss%aP_u(nc))
+			! D_f 用未松弛的aP_u，不使用aP/alpha_u
+			D_base = SIMPLEC_RC_DAMPING * 0.5d0*(mesh%cVols(oc)/ss%aP_u(oc) + mesh%cVols(nc)/ss%aP_u(nc))
+			grad_face_dot_area = orth_coeff * (ss%p(nc)-ss%p(oc)) &
+				+ SIMPLEC_NONORTH_CORRECTION * dot_product(0.5d0*(gP(oc,:)+gP(nc,:)), nonorth)
 			
-			! Rhie-Chow 预测面通量
+			! Rhie-Chow 预测面通量：正交部分隐式、非正交部分显式修正
 			fv(1) = 0.5d0*(ss%u(oc)+ss%u(nc))
 			fv(2) = 0.5d0*(ss%v(oc)+ss%v(nc))
 			fv(3) = 0.5d0*(ss%w(oc)+ss%w(nc))
-			flux_s = rho * dot_product(fv, fn) &
-				- rho * D_f * ((ss%p(nc)-ss%p(oc))/d_m * fn_m &
-				  - dot_product(0.5d0*(gP(oc,:)+gP(nc,:)), fn))
+			flux_s = rho * dot_product(fv, fn) - rho * D_base * grad_face_dot_area
 			
 			! 存储预测面通量
 			ss%phi_f(f) = flux_s
@@ -4714,8 +4839,8 @@ function triangleCentroid(points)
 			src(oc) = src(oc) - flux_s
 			src(nc) = src(nc) + flux_s
 			
-			! 压力方程系数
-			D_f = rho * D_f * fn_m / d_m
+			! 压力方程系数：只把正交部分放入矩阵，非正交项已在通量中显式修正
+			D_f = rho * D_base * orth_coeff
 			aP_pp(oc) = aP_pp(oc) + D_f
 			aP_pp(nc) = aP_pp(nc) + D_f
 			
@@ -4751,9 +4876,12 @@ function triangleCentroid(points)
 					src(oc) = src(oc) - flux_s
 					! 出口 p'=0 贡献
 					d_m = max(mag(mesh%fCenters(face_idx,:)-mesh%cCenters(oc,:)), 1.0d-10)
-					D_f = mesh%cVols(oc) / ss%aP_u(oc)
+					D_f = SIMPLEC_RC_DAMPING * mesh%cVols(oc) / ss%aP_u(oc)
 					D_f = rho * D_f * fn_m / d_m
 					aP_pp(oc) = aP_pp(oc) + D_f
+					! Weak fixed-gauge outlet reference: drive outlet pressure toward
+					! p'= -p without hard-clipping the field.
+					src(oc) = src(oc) - SIMPLEC_OUTLET_PRESSURE_RELAX * D_f * ss%p(oc)
 				end select
 			end do
 		end do
@@ -4762,19 +4890,20 @@ function triangleCentroid(points)
 			if (aP_pp(c) < 1.0d-30) aP_pp(c) = 1.0d0
 		end do
 		
-		! GS 求解 p'
-		do gs = 1, SIMPLE_MAX_INNER_P
-			do c = 1, ss%nCells
-				nb_s = 0.0d0
-				do idx = 1, nb_n(c)
-					nb_s = nb_s + aN_pp(c,idx)*ss%p_prime(nb_i(c,idx))
-				end do
-				ss%p_prime(c) = (src(c) + nb_s) / aP_pp(c)
-			end do
-		end do
+		! PCG 求解 p'。压力矩阵是 aP*p' - sum(aN*p'_nb) = src，
+		! 对角预处理共轭梯度比逐点GS更快消除全局压力误差。
+		call simplec_pressure_pcg(ss%nCells, MNB, aP_pp, aN_pp, nb_i, nb_n, src, &
+		                          ss%p_prime, SIMPLE_MAX_INNER_P, SIMPLE_PCG_TOLERANCE)
 		
-		! SIMPLEC: alpha_p 可以接近1但仍需一定松弛
-		ss%p = ss%p + SIMPLE_ALPHA_P * ss%p_prime
+		! 压力修正仍使用动压尺度的单步限制以避免小单元发散；
+		! 本轮只回退动量方程冻结项，不再用压力限制掩盖入口/壁面问题。
+		p_step_limit = SIMPLEC_MAX_PRESSURE_STEP_FACTOR * max(0.5d0*rho*mag(U_in)**2, 1.0d0)
+		p_prime_max = maxval(abs(ss%p_prime))
+		alpha_p_eff = SIMPLE_ALPHA_P
+		if (SIMPLE_ALPHA_P * p_prime_max > p_step_limit) then
+			alpha_p_eff = p_step_limit / max(p_prime_max, 1.0d-30)
+		end if
+		ss%p = ss%p + alpha_p_eff * ss%p_prime
 		
 		! 减去均值防漂移
 		ss%p = ss%p - sum(ss%p) / dble(ss%nCells)
@@ -4784,17 +4913,18 @@ function triangleCentroid(points)
 		allocate(tg(ss%nCells, 1, 3))
 		tg = greenGaussGrad_RANS(mesh, pm, .false.)
 		allocate(gPp(ss%nCells, 3))
-		gPp(:,1) = tg(:,1,1); gPp(:,2) = tg(:,1,2); gPp(:,3) = tg(:,1,3)
+		! Correct every velocity component with the full pressure-correction gradient.
+		gPp(:,1) = tg(:,1,1)
+		gPp(:,2) = tg(:,1,2)
+		gPp(:,3) = tg(:,1,3)
 		deallocate(tg, pm)
 		
-		! 速度修正：用 aP_u（SIMPLEC的 aP-H）
+		! 速度修正：用未松弛的 aP_u
 		do c = 1, ss%nCells
-			D_c = mesh%cVols(c) / ss%aP_u(c)
-			ss%u(c) = ss%u(c) - D_c * gPp(c,1)
-			ss%v(c) = ss%v(c) - D_c * gPp(c,2)
-			ss%w(c) = ss%w(c) - D_c * gPp(c,3)
-			! D_c 物理上限：最大速度修正 ~ U_ref
-			D_c = min(D_c, mesh%cVols(c)**(1.0d0/3.0d0) / max(mag(U_in), 1.0d0))
+			D_c = SIMPLEC_RC_DAMPING * mesh%cVols(c) / ss%aP_u(c)
+			ss%u(c) = ss%u(c) - alpha_p_eff * D_c * gPp(c,1)
+			ss%v(c) = ss%v(c) - alpha_p_eff * D_c * gPp(c,2)
+			ss%w(c) = ss%w(c) - alpha_p_eff * D_c * gPp(c,3)
 		end do
 		
 		! 面通量增量修正
@@ -4803,11 +4933,15 @@ function triangleCentroid(points)
 			if (oc<1.or.oc>ss%nCells.or.nc<1.or.nc>ss%nCells) cycle
 			fn = mesh%fAVecs(f,:); fn_m = mag(fn)
 			if (fn_m < 1.0d-30) cycle
-			d_m = mag(mesh%cCenters(nc,:)-mesh%cCenters(oc,:))
-			if (d_m < 1.0d-30) cycle
-			D_f = 0.5d0*(mesh%cVols(oc)/ss%aP_u(oc) + mesh%cVols(nc)/ss%aP_u(nc))
-			D_f = rho * D_f * fn_m / d_m
-			ss%phi_f(f) = ss%phi_f(f) - D_f * (ss%p_prime(nc) - ss%p_prime(oc))
+			dvec = mesh%cCenters(nc,:) - mesh%cCenters(oc,:)
+			d2 = max(dot_product(dvec, dvec), 1.0d-30)
+			d_m = sqrt(d2)
+			orth_coeff = dot_product(fn, dvec) / d2
+			if (orth_coeff <= 0.0d0) orth_coeff = fn_m / d_m
+			orth_coeff = max(orth_coeff, 0.05d0 * fn_m / d_m)
+			D_f = SIMPLEC_RC_DAMPING * 0.5d0*(mesh%cVols(oc)/ss%aP_u(oc) + mesh%cVols(nc)/ss%aP_u(nc))
+			D_f = rho * D_f * orth_coeff
+			ss%phi_f(f) = ss%phi_f(f) - alpha_p_eff * D_f * (ss%p_prime(nc) - ss%p_prime(oc))
 		end do
 		
 		! 出口面通量更新
@@ -4826,6 +4960,340 @@ function triangleCentroid(points)
 		
 		deallocate(gP, gPp)
 	end subroutine simplec_pressure
+
+!-----------------------------------------------------------------------
+! 对角预处理共轭梯度求解压力修正方程
+!-----------------------------------------------------------------------
+	subroutine simplec_pressure_pcg(nCells, maxNb, aP, aN, nb_i, nb_n, rhs, x, maxIter, relTol)
+		implicit none
+		integer, intent(in) :: nCells, maxNb, maxIter
+		real(kind=8), intent(in) :: aP(nCells), aN(nCells, maxNb), rhs(nCells), relTol
+		integer, intent(in) :: nb_i(nCells, maxNb), nb_n(nCells)
+		real(kind=8), intent(inout) :: x(nCells)
+		integer :: iter, c
+		real(kind=8), allocatable :: r(:), z(:), pvec(:), Avec(:)
+		real(kind=8) :: alpha_cg, beta_cg, rz_old, rz_new, pAp, bnorm, rnorm
+		real(kind=8) :: diag
+
+		allocate(r(nCells), z(nCells), pvec(nCells), Avec(nCells))
+
+		call simplec_apply_pressure_matrix(nCells, maxNb, aP, aN, nb_i, nb_n, x, Avec)
+		r = rhs - Avec
+		bnorm = sqrt(sum(rhs*rhs))
+		if (bnorm < 1.0d-30) then
+			x = 0.0d0
+			deallocate(r, z, pvec, Avec)
+			return
+		end if
+
+		do c = 1, nCells
+			diag = max(aP(c), 1.0d-30)
+			z(c) = r(c) / diag
+		end do
+		pvec = z
+		rz_old = sum(r*z)
+
+		do iter = 1, maxIter
+			call simplec_apply_pressure_matrix(nCells, maxNb, aP, aN, nb_i, nb_n, pvec, Avec)
+			pAp = sum(pvec*Avec)
+			if (abs(pAp) < 1.0d-300) exit
+			alpha_cg = rz_old / pAp
+			x = x + alpha_cg * pvec
+			r = r - alpha_cg * Avec
+			rnorm = sqrt(sum(r*r))
+			if (rnorm <= relTol * bnorm) exit
+			do c = 1, nCells
+				diag = max(aP(c), 1.0d-30)
+				z(c) = r(c) / diag
+			end do
+			rz_new = sum(r*z)
+			if (abs(rz_old) < 1.0d-300) exit
+			beta_cg = rz_new / rz_old
+			pvec = z + beta_cg * pvec
+			rz_old = rz_new
+		end do
+
+		deallocate(r, z, pvec, Avec)
+	end subroutine simplec_pressure_pcg
+
+	subroutine simplec_apply_pressure_matrix(nCells, maxNb, aP, aN, nb_i, nb_n, x, Ax)
+		implicit none
+		integer, intent(in) :: nCells, maxNb
+		real(kind=8), intent(in) :: aP(nCells), aN(nCells, maxNb), x(nCells)
+		integer, intent(in) :: nb_i(nCells, maxNb), nb_n(nCells)
+		real(kind=8), intent(out) :: Ax(nCells)
+		integer :: c, idx
+
+		do c = 1, nCells
+			Ax(c) = aP(c) * x(c)
+			do idx = 1, nb_n(c)
+				Ax(c) = Ax(c) - aN(c,idx) * x(nb_i(c,idx))
+			end do
+		end do
+	end subroutine simplec_apply_pressure_matrix
+
+!-----------------------------------------------------------------------
+! SIMPLEC 诊断：定位压力/速度极值和各边界状态，避免只看全局极值
+!-----------------------------------------------------------------------
+	subroutine simplec_report_diagnostics(mesh, ss, bcs, iter)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(in) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		integer, intent(in) :: iter
+		integer :: c, b, fi, face_idx, oc, pmin_cell, pmax_cell, umax_cell, nFacesB
+		integer :: n_wall, n_front, n_roof, n_rear, n_wake, n_upstream
+		real(kind=8) :: speed, pmin_val, pmax_val, umax_val, p_range
+		real(kind=8) :: b_pmin, b_pmax, b_psum, b_umin, b_umax, b_usum, b_flux
+		real(kind=8) :: v_abs_max, v_rms, x_min, x_max, y_min, y_max, xw_min, xw_max, yw_min, yw_max
+		real(kind=8) :: wall_dx, wall_dy, front_p, roof_p, rear_p, wake_u, upstream_u, wake_deficit
+		logical, allocatable :: wall_cell(:)
+		character(len=100) :: bname
+
+		allocate(wall_cell(ss%nCells)); wall_cell = .false.
+		pmin_cell = 1; pmax_cell = 1; umax_cell = 1
+		pmin_val = ss%p(1); pmax_val = ss%p(1)
+		umax_val = sqrt(ss%u(1)**2 + ss%v(1)**2 + ss%w(1)**2)
+		v_abs_max = abs(ss%v(1)); v_rms = ss%v(1)**2
+		x_min = mesh%cCenters(1,1); x_max = mesh%cCenters(1,1)
+		y_min = mesh%cCenters(1,2); y_max = mesh%cCenters(1,2)
+		do c = 2, ss%nCells
+			x_min = min(x_min, mesh%cCenters(c,1)); x_max = max(x_max, mesh%cCenters(c,1))
+			y_min = min(y_min, mesh%cCenters(c,2)); y_max = max(y_max, mesh%cCenters(c,2))
+			v_abs_max = max(v_abs_max, abs(ss%v(c)))
+			v_rms = v_rms + ss%v(c)**2
+			if (ss%p(c) < pmin_val) then
+				pmin_val = ss%p(c); pmin_cell = c
+			end if
+			if (ss%p(c) > pmax_val) then
+				pmax_val = ss%p(c); pmax_cell = c
+			end if
+			speed = sqrt(ss%u(c)**2 + ss%v(c)**2 + ss%w(c)**2)
+			if (speed > umax_val) then
+				umax_val = speed; umax_cell = c
+			end if
+		end do
+		v_rms = sqrt(v_rms / dble(ss%nCells))
+
+		p_range = pmax_val - pmin_val
+		write(*,'(A,I6,A,I8,A,3F10.4,A,I8,A,3F10.4,A,I8,A,F10.4,A,ES11.3)') &
+			'  diag', iter, ' pMinCell=', pmin_cell, ' xyz=', mesh%cCenters(pmin_cell,:), &
+			' pMaxCell=', pmax_cell, ' xyz=', mesh%cCenters(pmax_cell,:), &
+			' uMaxCell=', umax_cell, ' |U|=', umax_val, ' rawDp=', p_range
+		if (p_range > SIMPLE_MAX_PRESSURE_RANGE .or. umax_val > SIMPLE_MAX_SPEED) then
+			write(*,'(A,ES11.3,A,F10.3,A)') '  diag warning: rawDp=', p_range, &
+				' Umax=', umax_val, ' exceeds diagnostic target; not clipped.'
+		end if
+
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			nFacesB = 0; b_psum = 0.0d0; b_usum = 0.0d0; b_umax = 0.0d0; b_flux = 0.0d0
+			b_pmin = huge(1.0d0); b_pmax = -huge(1.0d0); b_umin = huge(1.0d0)
+			bname = 'boundary'
+			if (allocated(mesh%boundaryNames) .and. b <= size(mesh%boundaryNames)) then
+				bname = trim(adjustl(mesh%boundaryNames(b)))
+			end if
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx<1 .or. face_idx>ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1)
+				if (oc<1 .or. oc>ss%nCells) cycle
+				nFacesB = nFacesB + 1
+				b_psum = b_psum + ss%p(oc)
+				b_pmin = min(b_pmin, ss%p(oc)); b_pmax = max(b_pmax, ss%p(oc))
+				speed = sqrt(ss%u(oc)**2 + ss%v(oc)**2 + ss%w(oc)**2)
+				b_umin = min(b_umin, speed); b_umax = max(b_umax, speed)
+				b_usum = b_usum + speed
+				b_flux = b_flux + ss%phi_f(face_idx)
+			end do
+			if (nFacesB > 0) then
+				write(*,'(A,I2,1X,A,A,ES11.3,A,ES11.3,A,ES11.3,A,F8.3,A,F8.3,A,F8.3,A,ES11.3)') &
+					'    bc', b, trim(bname), ' pAvg=', b_psum/dble(nFacesB), &
+					' pMin=', b_pmin, ' pMax=', b_pmax, ' uMin=', b_umin, &
+					' uAvg=', b_usum/dble(nFacesB), ' uMax=', b_umax, ' flux=', b_flux
+			end if
+		end do
+
+
+		! Spatial sanity diagnostics for contour plots.  A physically meaningful
+		! car/airfoil low-Mach solution should not look like a pure one-dimensional
+		! inlet-to-outlet ramp: wall sectors and wake/upstream samples should expose
+		! stagnation, roof/rear suction and wake velocity deficit trends.
+		n_wall = 0
+		xw_min = huge(1.0d0); xw_max = -huge(1.0d0)
+		yw_min = huge(1.0d0); yw_max = -huge(1.0d0)
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			if (bcs(b)%type /= wallBoundary) cycle
+			bname = 'boundary'
+			if (allocated(mesh%boundaryNames) .and. b <= size(mesh%boundaryNames)) then
+				bname = trim(adjustl(mesh%boundaryNames(b)))
+			end if
+			! Symmetry/slip patches are not the car/airfoil body for contour-physics
+			! sector diagnostics.
+			if (index(bname, 'symmetry') > 0) cycle
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx<1 .or. face_idx>ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1)
+				if (oc<1 .or. oc>ss%nCells) cycle
+				if (.not. wall_cell(oc)) then
+					wall_cell(oc) = .true.; n_wall = n_wall + 1
+					xw_min = min(xw_min, mesh%cCenters(oc,1)); xw_max = max(xw_max, mesh%cCenters(oc,1))
+					yw_min = min(yw_min, mesh%cCenters(oc,2)); yw_max = max(yw_max, mesh%cCenters(oc,2))
+				end if
+			end do
+		end do
+
+		front_p = 0.0d0; roof_p = 0.0d0; rear_p = 0.0d0; wake_u = 0.0d0; upstream_u = 0.0d0
+		n_front = 0; n_roof = 0; n_rear = 0; n_wake = 0; n_upstream = 0
+		if (n_wall > 0) then
+			wall_dx = max(xw_max - xw_min, 1.0d-12)
+			wall_dy = max(yw_max - yw_min, 1.0d-12)
+			do c = 1, ss%nCells
+				if (wall_cell(c)) then
+					if (mesh%cCenters(c,1) <= xw_min + 0.15d0*wall_dx) then
+						front_p = front_p + ss%p(c); n_front = n_front + 1
+					end if
+					if (mesh%cCenters(c,2) >= yw_min + 0.70d0*wall_dy) then
+						roof_p = roof_p + ss%p(c); n_roof = n_roof + 1
+					end if
+					if (mesh%cCenters(c,1) >= xw_max - 0.15d0*wall_dx) then
+						rear_p = rear_p + ss%p(c); n_rear = n_rear + 1
+					end if
+				end if
+				if (mesh%cCenters(c,1) > xw_max + 0.05d0*wall_dx .and. &
+				    mesh%cCenters(c,2) >= yw_min .and. mesh%cCenters(c,2) <= yw_max) then
+					wake_u = wake_u + ss%u(c); n_wake = n_wake + 1
+				end if
+				if (mesh%cCenters(c,1) < xw_min - 0.05d0*wall_dx .and. &
+				    mesh%cCenters(c,2) >= yw_min .and. mesh%cCenters(c,2) <= yw_max) then
+					upstream_u = upstream_u + ss%u(c); n_upstream = n_upstream + 1
+				end if
+			end do
+			if (n_front > 0) front_p = front_p / dble(n_front)
+			if (n_roof > 0) roof_p = roof_p / dble(n_roof)
+			if (n_rear > 0) rear_p = rear_p / dble(n_rear)
+			if (n_wake > 0) wake_u = wake_u / dble(n_wake)
+			if (n_upstream > 0) upstream_u = upstream_u / dble(n_upstream)
+			wake_deficit = upstream_u - wake_u
+			write(*,'(A,I6,A,ES11.3,A,ES11.3,A,ES11.3,A,ES11.3,A,ES11.3,A,ES11.3,A,ES11.3)') &
+				'  phys', iter, ' vMax=', v_abs_max, ' vRms=', v_rms, ' frontP=', front_p, &
+				' roofP=', roof_p, ' rearP=', rear_p, ' wakeUx=', wake_u, ' wakeDef=', wake_deficit
+		end if
+
+		call simplec_report_physics_checks(mesh, ss, bcs, iter)
+
+		deallocate(wall_cell)
+	end subroutine simplec_report_diagnostics
+
+
+!-----------------------------------------------------------------------
+! SIMPLEC 物理核查：近壁层、入口、质量和压力-速度耦合健康度
+!-----------------------------------------------------------------------
+	subroutine simplec_report_physics_checks(mesh, ss, bcs, iter)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(in) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		integer, intent(in) :: iter
+		integer :: c, b, fi, face_idx, oc, layer, counts(4), inletCount, outletCount
+		real(kind=8) :: speed, y, y_min, Uref, layerUSum(4), layerMuRatio(4)
+		real(kind=8) :: inletFlux, outletFlux, inletUmin, inletUavg, outletUavg, pRange
+		real(kind=8) :: aPmin, aPmax, pPrimeMax, massImb
+
+		counts = 0; layerUSum = 0.0d0; layerMuRatio = 0.0d0
+		inletFlux = 0.0d0; outletFlux = 0.0d0; inletCount = 0; outletCount = 0
+		inletUmin = huge(1.0d0); inletUavg = 0.0d0; outletUavg = 0.0d0
+		Uref = max(maxval(sqrt(ss%u**2 + ss%v**2 + ss%w**2)), 1.0d-12)
+		pRange = maxval(ss%p) - minval(ss%p)
+		aPmin = minval(ss%aP_u); aPmax = maxval(ss%aP_u)
+		pPrimeMax = maxval(abs(ss%p_prime))
+
+		y_min = huge(1.0d0)
+		if (allocated(mesh%wallDistance)) then
+			do c = 1, ss%nCells
+				if (mesh%wallDistance(c) > 1.0d-12) y_min = min(y_min, mesh%wallDistance(c))
+			end do
+		end if
+		if (y_min == huge(1.0d0)) y_min = max(minval(mesh%cVols)**(1.0d0/3.0d0), 1.0d-12)
+
+		do c = 1, ss%nCells
+			if (allocated(mesh%wallDistance)) then
+				y = max(mesh%wallDistance(c), y_min)
+			else
+				y = y_min
+			end if
+			if (y <= 1.5d0*y_min) then
+				layer = 1
+			else if (y <= 3.0d0*y_min) then
+				layer = 2
+			else if (y <= 6.0d0*y_min) then
+				layer = 3
+			else
+				layer = 4
+			end if
+			speed = sqrt(ss%u(c)**2 + ss%v(c)**2 + ss%w(c)**2)
+			counts(layer) = counts(layer) + 1
+			layerUSum(layer) = layerUSum(layer) + speed
+			layerMuRatio(layer) = layerMuRatio(layer) + ss%mu_t(c) / max(ss%mu_l(c), 1.0d-30)
+		end do
+
+		do layer = 1, 4
+			if (counts(layer) > 0) then
+				layerUSum(layer) = layerUSum(layer) / dble(counts(layer))
+				layerMuRatio(layer) = layerMuRatio(layer) / dble(counts(layer))
+			end if
+		end do
+
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx<1 .or. face_idx>ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1)
+				if (oc<1 .or. oc>ss%nCells) cycle
+				speed = sqrt(ss%u(oc)**2 + ss%v(oc)**2 + ss%w(oc)**2)
+				select case (bcs(b)%type)
+				case (InletBoundary)
+					inletFlux = inletFlux + ss%phi_f(face_idx)
+					inletUmin = min(inletUmin, speed)
+					inletUavg = inletUavg + speed
+					inletCount = inletCount + 1
+				case (OutletBoundary)
+					outletFlux = outletFlux + ss%phi_f(face_idx)
+					outletUavg = outletUavg + speed
+					outletCount = outletCount + 1
+				end select
+			end do
+		end do
+		if (inletCount > 0) inletUavg = inletUavg / dble(inletCount)
+		if (outletCount > 0) outletUavg = outletUavg / dble(outletCount)
+		massImb = inletFlux + outletFlux
+
+		write(*,'(A,I6,A,ES10.3,A,ES10.3,A,ES10.3,A,ES10.3,A,ES10.3,A,ES10.3)') &
+			'  check', iter, ' massImb=', massImb, ' pPrimeMax=', pPrimeMax, &
+			' pRange=', pRange, ' aPuMin=', aPmin, ' aPuMax=', aPmax, ' Uref=', Uref
+		write(*,'(A,I6,A,F8.3,A,F8.3,A,F8.3,A,F8.3,A,F8.3,A,F8.3)') &
+			'  wallLayer', iter, ' U1=', layerUSum(1), ' U2=', layerUSum(2), &
+			' U3=', layerUSum(3), ' Ufar=', layerUSum(4), ' muT1/mu=', layerMuRatio(1), &
+			' muT2/mu=', layerMuRatio(2)
+		write(*,'(A,I6,A,F8.3,A,F8.3,A,F8.3,A,ES10.3,A)') &
+			'  bcCheck', iter, ' inletUmin=', inletUmin, ' inletUavg=', inletUavg, &
+			' outletUavg=', outletUavg, ' fluxSum=', massImb, ' (inlet/outlet should balance)'
+		if (counts(1) > 0 .and. counts(2) > 0) then
+			if (abs(Uref-layerUSum(1)) > 3.0d0*max(abs(Uref-layerUSum(2)), 1.0d-6)) then
+				write(*,'(A)') '  causeHint: wall deficit mostly first-layer only; near-wall mu_t or wall-normal mesh is suspect.'
+			end if
+		end if
+		if (inletCount > 0 .and. inletUmin < 0.95d0*Uref) then
+			write(*,'(A)') '  causeHint: inlet owner cells are below freestream; inspect inlet pressure correction/Rhie-Chow coupling.'
+		end if
+		if (abs(massImb) > 1.0d-6*max(abs(inletFlux), 1.0d0)) then
+			write(*,'(A)') '  causeHint: inlet/outlet mass flux not balanced; pressure correction or outlet flux is suspect.'
+		end if
+	end subroutine simplec_report_physics_checks
+
 
 !-----------------------------------------------------------------------
 ! 全局质量通量修正
@@ -4866,14 +5334,100 @@ function triangleCentroid(points)
 						oc = mesh%faces(face_idx, 1)
 						if (oc<1.or.oc>ss%nCells) cycle
 						ss%phi_f(face_idx) = ss%phi_f(face_idx) * corr
-						ss%u(oc) = ss%u(oc) * corr
-						ss%v(oc) = ss%v(oc) * corr
-						ss%w(oc) = ss%w(oc) * corr
 					end do
 				end do
 			end if
 		end if
 	end subroutine simple2_mass_fix
+
+
+!-----------------------------------------------------------------------
+! 固定速度入口约束：用于消除入口相邻单元的非物理低速带
+!-----------------------------------------------------------------------
+	subroutine simple_enforce_inlet_velocity(mesh, ss, bcs, U_in)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(inout) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		real(kind=8), intent(in) :: U_in(3)
+		integer :: b, fi, face_idx, oc, c
+		real(kind=8) :: U_mag, eU(3), s_face, s_owner, s_limit, max_owner_gap
+		logical :: has_inlet
+
+		U_mag = max(mag(U_in), 1.0d-12)
+		eU = U_in / U_mag
+		has_inlet = .false.
+		s_limit = -huge(1.0d0)
+		max_owner_gap = 0.0d0
+
+		! 先固定入口面相邻单元，同时估计入口法向第一层网格厚度。
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			if (bcs(b)%type /= InletBoundary) cycle
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx<1 .or. face_idx>ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1)
+				if (oc<1 .or. oc>ss%nCells) cycle
+				ss%u(oc) = U_in(1)
+				ss%v(oc) = U_in(2)
+				ss%w(oc) = U_in(3)
+				s_face = dot_product(mesh%fCenters(face_idx,:), eU)
+				s_owner = dot_product(mesh%cCenters(oc,:), eU)
+				s_limit = max(s_limit, s_face)
+				max_owner_gap = max(max_owner_gap, abs(s_owner - s_face))
+				has_inlet = .true.
+			end do
+		end do
+
+		if (.not. has_inlet) return
+		if (max_owner_gap <= 1.0d-12) max_owner_gap = maxval(mesh%cVols)**(1.0d0/3.0d0)
+		s_limit = s_limit + SIMPLE_INLET_BUFFER_WIDTH_CELLS * max_owner_gap
+
+		! 对入口后若干个上游缓冲层保持固定来流，防止压力修正/RC项在入口
+		! 内侧形成一条非物理低速带。缓冲厚度按入口第一层网格尺度定义。
+		do c = 1, ss%nCells
+			if (dot_product(mesh%cCenters(c,:), eU) <= s_limit) then
+				ss%u(c) = U_in(1)
+				ss%v(c) = U_in(2)
+				ss%w(c) = U_in(3)
+			end if
+		end do
+	end subroutine simple_enforce_inlet_velocity
+
+!-----------------------------------------------------------------------
+! 粗网格壁函数/近壁约束：对 wall 相邻单元设置 omega 下限并阻尼 mu_t
+!-----------------------------------------------------------------------
+	subroutine simple_apply_wall_functions(mesh, ss, bcs, fluid)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(inout) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		type(Fluidd), intent(in) :: fluid
+		integer :: b, fi, face_idx, oc
+		real(kind=8) :: rho, y, speed, u_tau, mu_t_floor, mu_t_cap
+
+		rho = ss%rho_ref
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			if (bcs(b)%type /= wallBoundary) cycle
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx<1 .or. face_idx>ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1)
+				if (oc<1 .or. oc>ss%nCells) cycle
+				y = max(mag(mesh%fCenters(face_idx,:)-mesh%cCenters(oc,:)), 1.0d-8)
+				if (allocated(mesh%wallDistance)) y = max(min(y, mesh%wallDistance(oc)), 1.0d-8)
+				speed = sqrt(ss%u(oc)**2 + ss%v(oc)**2 + ss%w(oc)**2)
+				u_tau = sqrt(max(fluid%mu_laminar * speed / (rho * y), SMALL_NUM))
+				! 混合长度型涡黏性下限：只增加不足的近壁扩散，不再强行压低 mu_t/k/omega。
+				mu_t_floor = rho * KAPPA * y * u_tau
+				mu_t_floor = max(mu_t_floor, SIMPLEC_WALL_MU_T_FLOOR_FACTOR * ss%mu_l(oc))
+				mu_t_cap = SIMPLEC_WALL_MU_T_CAP_FACTOR * ss%mu_l(oc)
+				ss%mu_t(oc) = min(max(ss%mu_t(oc), mu_t_floor), mu_t_cap)
+			end do
+		end do
+	end subroutine simple_apply_wall_functions
 
 !-----------------------------------------------------------------------
 ! 湍流更新
