@@ -65,6 +65,9 @@ module BuFlowModule
     real(kind=8), parameter :: SIMPLE_INLET_BUFFER_WIDTH_CELLS = 8.0d0
     real(kind=8), parameter :: SIMPLEC_WALL_MU_T_FLOOR_FACTOR = 80.0d0
     real(kind=8), parameter :: SIMPLEC_WALL_MU_T_CAP_FACTOR = 1000.0d0
+    integer, parameter :: SIMPLEC_TURB_UPDATE_INTERVAL = 20
+    real(kind=8), parameter :: SIMPLEC_FREESTREAM_TURB_RELAX = 0.20d0
+    real(kind=8), parameter :: SIMPLEC_TURB_SOURCE_LIMIT = 10.0d0
     ! SIMPLEC controlled experiments for car-mesh contour regression.
     ! 0: current equation-level solver, no global clipping.
     ! 1: reproduce buflowRANS4 post-processing: x-gradient-only + global p/U bounds + flux rebuild.
@@ -4389,6 +4392,44 @@ function triangleCentroid(points)
 
 !===============================================================================
 
+
+!-----------------------------------------------------------------------
+! Recompute SIMPLEC wall distance from true wallBoundary patches only.
+! Farfield free-flow patches must not define the turbulent near-wall scale.
+!-----------------------------------------------------------------------
+	subroutine simplec_compute_body_wall_distances(mesh, bcs)
+		implicit none
+		type(Meshh), intent(inout) :: mesh
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		integer :: c, b, fi, face_idx, nCells, nFaces, nWallFaces
+		real(kind=8) :: min_dist, dist
+		if (.not. allocated(mesh%cCenters)) return
+		nCells = size(mesh%cCenters, 1); nFaces = size(mesh%faces, 1)
+		if (.not. allocated(mesh%wallDistance)) allocate(mesh%wallDistance(nCells))
+		mesh%wallDistance = 1.0d10; nWallFaces = 0
+		do c = 1, nCells
+			min_dist = 1.0d10
+			do b = 1, min(size(bcs), size(mesh%boundaryFaces, 1))
+				if (bcs(b)%type /= wallBoundary) cycle
+				do fi = 1, size(mesh%boundaryFaces, 2)
+					face_idx = mesh%boundaryFaces(b, fi)
+					if (face_idx == 0) exit
+					if (face_idx < 1 .or. face_idx > nFaces) cycle
+					if (c == 1) nWallFaces = nWallFaces + 1
+					dist = mag(mesh%cCenters(c,:) - mesh%fCenters(face_idx,:))
+					min_dist = min(min_dist, dist)
+				end do
+			end do
+			mesh%wallDistance(c) = min_dist
+		end do
+		if (nWallFaces <= 0) then
+			print *, 'WARNING: SIMPLEC found no body wall faces; using generic wall distance.'
+		else
+			print *, 'SIMPLEC body-wall distances recomputed from wall patches only. Faces:', nWallFaces
+			print *, '  Body wall distance range:', minval(mesh%wallDistance), maxval(mesh%wallDistance)
+		end if
+	end subroutine simplec_compute_body_wall_distances
+
 !-----------------------------------------------------------------------
 ! 根据 OpenFOAM boundary 名称配置边界条件，避免 SIMPLEC 依赖硬编码顺序
 !-----------------------------------------------------------------------
@@ -4422,10 +4463,11 @@ function triangleCentroid(points)
 				allocate(boundaryConditions(b)%params(0))
 				print *, '  ', trim(bname), ' -> empty/slip'
 			case ('symmetry', 'symmetryPlane')
-				! 按用户要求恢复：symmetry 与车身/壁面使用同一 wall 边界处理。
-				boundaryConditions(b)%type = wallBoundary
+				! 汽车 40 km/h 外流整体是自由外流；symmetry 是远场/对称滑移面，
+				! 不能作为固定湍流壁面，否则会把近壁湍流约束错误扩展到远场。
+				boundaryConditions(b)%type = emptyBoundary
 				allocate(boundaryConditions(b)%params(0))
-				print *, '  ', trim(bname), ' -> wall'
+				print *, '  ', trim(bname), ' -> symmetry/slip'
 			case ('inlet', 'Inlet')
 				boundaryConditions(b)%type = InletBoundary
 				allocate(boundaryConditions(b)%params(6))
@@ -4486,6 +4528,7 @@ function triangleCentroid(points)
 		nInt = ss%nFaces - ss%nBdryFaces
 		
 		call computeWallDistances(mesh)
+		call simplec_compute_body_wall_distances(mesh, boundaryConditions)
 		
 		ss%rho_ref = P_init / (fluid%R * T_init)
 		ss%p_ref = P_init
@@ -4516,6 +4559,8 @@ function triangleCentroid(points)
 			fn = mesh%fAVecs(f,:)
 			ss%phi_f(f) = rho * dot_product(U_init, fn)
 		end do
+		call simplec_apply_turbulence_bcs(mesh, ss, boundaryConditions, fluid, U_init, k_init, omega_init)
+		call simplec_rebuild_face_fluxes(mesh, ss, boundaryConditions, U_init)
 		
 		print *, ''
 		print *, '=========================================='
@@ -4533,6 +4578,8 @@ function triangleCentroid(points)
 		case default
 			print *, ' SIMPLEC experiment: current equation-level solver (no global clipping)'
 		end select
+		call simplec_report_boundary_audit(mesh, ss, boundaryConditions, U_init, k_init, omega_init)
+		call simplec_report_conservation_audit(mesh, ss, boundaryConditions, 0)
 		call flush(6)
 		print *, ''
 		
@@ -4572,10 +4619,12 @@ function triangleCentroid(points)
 			! 步骤3：全局质量修正
 			call simple2_mass_fix(mesh, ss, boundaryConditions, rho, U_init)
 			
-			! 步骤4：湍流更新（延迟启动）
-			if (mod(iter, 100) == 0 .and. iter > 500) then
-				call simple_turbulence(mesh, ss, fluid)
+			! 步骤4：k-omega 湍流更新。外场维持自由流湍流，车身壁面施加
+			! 与密度基求解器一致的 fixed turbulent wall-function 约束。
+			if (mod(iter, SIMPLEC_TURB_UPDATE_INTERVAL) == 0) then
+				call simple_turbulence(mesh, ss, fluid, k_init, omega_init)
 			end if
+			call simplec_apply_turbulence_bcs(mesh, ss, boundaryConditions, fluid, U_init, k_init, omega_init)
 			
 			! L2残差
 			res_u = sqrt(sum((ss%u-u_old)**2)/ss%nCells) / max(mag(U_init), 1.0d-10)
@@ -4589,6 +4638,7 @@ function triangleCentroid(points)
 					'  Umax=', maxval(sqrt(ss%u**2+ss%v**2+ss%w**2)), &
 					'  dp=', maxval(ss%p)-minval(ss%p)
 				call simplec_report_diagnostics(mesh, ss, boundaryConditions, iter)
+				call simplec_report_conservation_audit(mesh, ss, boundaryConditions, iter)
 				call flush(6)
 			end if
 			
@@ -5041,6 +5091,7 @@ function triangleCentroid(points)
 		! 这里改为平滑移除 inlet-outlet 平均压力坡度，只校正远场
 		! 参考压力，不在局部制造压力不连续。
 		call simplec_remove_farfield_pressure_ramp(mesh, ss, bcs, U_in)
+		call simple_enforce_inlet_velocity(mesh, ss, bcs, U_in)
 		call simplec_rebuild_face_fluxes(mesh, ss, bcs, U_in)
 	end subroutine simplec_apply_low_mach_bounds
 
@@ -5458,6 +5509,7 @@ function triangleCentroid(points)
 		end do
 		if (inletCount > 0) inletUavg = inletUavg / dble(inletCount)
 		if (outletCount > 0) outletUavg = outletUavg / dble(outletCount)
+		if (inletCount > 0) Uref = max(inletUavg, 1.0d-12)
 		massImb = inletFlux + outletFlux
 
 		write(*,'(A,I6,A,ES10.3,A,ES10.3,A,ES10.3,A,ES10.3,A,ES10.3,A,ES10.3)') &
@@ -5482,6 +5534,99 @@ function triangleCentroid(points)
 			write(*,'(A)') '  causeHint: inlet/outlet mass flux not balanced; pressure correction or outlet flux is suspect.'
 		end if
 	end subroutine simplec_report_physics_checks
+
+
+!-----------------------------------------------------------------------
+! SIMPLEC boundary and finite-volume conservation audits.
+!-----------------------------------------------------------------------
+	subroutine simplec_report_boundary_audit(mesh, ss, bcs, U_in, k_inf, omega_inf)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(in) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		real(kind=8), intent(in) :: U_in(3), k_inf, omega_inf
+		integer :: b, fi, face_idx, nFacesB
+		real(kind=8) :: areaSum, prescribedFlux, fn(3)
+		character(len=100) :: bname, btype, meaning
+		write(*,'(A)') '  bcAudit: 40 km/h car case = free-flow farfield + fixed turbulent body wall'
+		write(*,'(A,ES11.3,A,ES11.3,A,ES11.3)') '  bcAudit freestream: |U|=', mag(U_in), &
+			' kInf=', k_inf, ' omegaInf=', omega_inf
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			bname = 'boundary'
+			if (allocated(mesh%boundaryNames) .and. b <= size(mesh%boundaryNames)) then
+				bname = trim(adjustl(mesh%boundaryNames(b)))
+			end if
+			select case (bcs(b)%type)
+			case (wallBoundary)
+				btype = 'wall'; meaning = 'fixed turbulent no-slip body wall; phi=0, wall-function k/omega'
+			case (InletBoundary)
+				btype = 'inlet'; meaning = 'fixed freestream U,k,omega; pressure corrected internally'
+			case (OutletBoundary)
+				btype = 'outlet'; meaning = 'zero-gradient velocity/turbulence with weak gauge pressure reference'
+			case (emptyBoundary)
+				btype = 'slip/empty'; meaning = 'free-flow/symmetry slip patch; no fixed turbulent wall constraint'
+			case default
+				btype = 'unknown'; meaning = 'check mapping'
+			end select
+			nFacesB = 0; areaSum = 0.0d0; prescribedFlux = 0.0d0
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi); if (face_idx == 0) exit
+				if (face_idx<1 .or. face_idx>ss%nFaces) cycle
+				fn = mesh%fAVecs(face_idx,:); nFacesB = nFacesB + 1
+				areaSum = areaSum + mag(fn); prescribedFlux = prescribedFlux + ss%rho_ref * dot_product(U_in, fn)
+			end do
+			write(*,'(A,I2,1X,A,1X,A,A,I7,A,ES11.3,A,ES11.3)') &
+				'    bcAudit patch', b, trim(bname), trim(btype), ' faces=', nFacesB, &
+				' area=', areaSum, ' freeFlux=', prescribedFlux
+			write(*,'(A,A)') '      meaning: ', trim(meaning)
+		end do
+	end subroutine simplec_report_boundary_audit
+
+	subroutine simplec_report_conservation_audit(mesh, ss, bcs, iter)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(in) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		integer, intent(in) :: iter
+		integer :: f, b, fi, face_idx, oc, nc, nInt, maxCell
+		real(kind=8), allocatable :: div(:)
+		real(kind=8) :: inletFlux, outletFlux, wallLeak, slipLeak, maxAbsDiv
+		real(kind=8) :: rmsDiv, netFlux, totalAbsBoundaryFlux
+		allocate(div(ss%nCells)); div = 0.0d0; nInt = ss%nFaces - ss%nBdryFaces
+		do f = 1, nInt
+			oc = mesh%faces(f,1); nc = mesh%faces(f,2)
+			if (oc<1 .or. oc>ss%nCells .or. nc<1 .or. nc>ss%nCells) cycle
+			div(oc) = div(oc) - ss%phi_f(f); div(nc) = div(nc) + ss%phi_f(f)
+		end do
+		inletFlux = 0.0d0; outletFlux = 0.0d0; wallLeak = 0.0d0
+		slipLeak = 0.0d0; totalAbsBoundaryFlux = 0.0d0
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi); if (face_idx == 0) exit
+				if (face_idx<1 .or. face_idx>ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1); if (oc<1 .or. oc>ss%nCells) cycle
+				div(oc) = div(oc) - ss%phi_f(face_idx)
+				totalAbsBoundaryFlux = totalAbsBoundaryFlux + abs(ss%phi_f(face_idx))
+				select case (bcs(b)%type)
+				case (InletBoundary); inletFlux = inletFlux + ss%phi_f(face_idx)
+				case (OutletBoundary); outletFlux = outletFlux + ss%phi_f(face_idx)
+				case (wallBoundary); wallLeak = wallLeak + abs(ss%phi_f(face_idx))
+				case (emptyBoundary); slipLeak = slipLeak + abs(ss%phi_f(face_idx))
+				end select
+			end do
+		end do
+		maxCell = maxloc(abs(div), dim=1)
+		maxAbsDiv = maxval(abs(div))
+		rmsDiv = sqrt(sum(div*div) / dble(ss%nCells))
+		netFlux = inletFlux + outletFlux
+		write(*,'(A,I6,A,ES11.3,A,ES11.3,A,ES11.3,A,ES11.3,A,ES11.3,A,I8)') &
+			'  cons', iter, ' inlet=', inletFlux, ' outlet=', outletFlux, ' net=', netFlux, &
+			' maxDiv=', maxAbsDiv, ' rmsDiv=', rmsDiv, ' maxCell=', maxCell
+		write(*,'(A,I6,A,ES11.3,A,ES11.3,A,ES11.3)') &
+			'  consLeak', iter, ' wallLeak=', wallLeak, ' slipLeak=', slipLeak, &
+			' absBoundaryFlux=', totalAbsBoundaryFlux
+		deallocate(div)
+	end subroutine simplec_report_conservation_audit
 
 
 !-----------------------------------------------------------------------
@@ -5618,16 +5763,75 @@ function triangleCentroid(points)
 		end do
 	end subroutine simple_apply_wall_functions
 
+
+!-----------------------------------------------------------------------
+! SIMPLEC k-omega boundary constraints.
+!-----------------------------------------------------------------------
+	subroutine simplec_apply_turbulence_bcs(mesh, ss, bcs, fluid, U_in, k_inf, omega_inf)
+		implicit none
+		type(Meshh), intent(in) :: mesh
+		type(SIMPLEState), intent(inout) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
+		type(Fluidd), intent(in) :: fluid
+		real(kind=8), intent(in) :: U_in(3), k_inf, omega_inf
+		integer :: b, fi, face_idx, oc, c
+		real(kind=8) :: rho, y, nu_wall, u_tau, y_plus, k_wall, omega_wall, C_mu, relax_ff
+		rho = ss%rho_ref; C_mu = BETA_STAR; relax_ff = SIMPLEC_FREESTREAM_TURB_RELAX
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi); if (face_idx == 0) exit
+				if (face_idx<1 .or. face_idx>ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1); if (oc<1 .or. oc>ss%nCells) cycle
+				select case (bcs(b)%type)
+				case (InletBoundary)
+					ss%k(oc) = max(k_inf, SMALL_NUM); ss%omega(oc) = max(omega_inf, SMALL_NUM)
+				case (emptyBoundary)
+					ss%k(oc) = max((1.0d0-relax_ff)*ss%k(oc) + relax_ff*k_inf, SMALL_NUM)
+					ss%omega(oc) = max((1.0d0-relax_ff)*ss%omega(oc) + relax_ff*omega_inf, SMALL_NUM)
+				case (OutletBoundary)
+					if (ss%phi_f(face_idx) < 0.0d0) then
+						ss%k(oc) = max((1.0d0-relax_ff)*ss%k(oc) + relax_ff*k_inf, SMALL_NUM)
+						ss%omega(oc) = max((1.0d0-relax_ff)*ss%omega(oc) + relax_ff*omega_inf, SMALL_NUM)
+					end if
+				case (wallBoundary)
+					y = max(mag(mesh%fCenters(face_idx,:)-mesh%cCenters(oc,:)), 1.0d-8)
+					if (allocated(mesh%wallDistance)) y = max(min(y, mesh%wallDistance(oc)), 1.0d-8)
+					nu_wall = max(ss%mu_l(oc) / max(rho, SMALL_NUM), SMALL_NUM)
+					u_tau = sqrt(max(C_mu * max(ss%k(oc), k_inf), SMALL_NUM))
+					y_plus = rho * u_tau * y / max(ss%mu_l(oc), SMALL_NUM)
+					if (y_plus > Y_PLUS_LAMINAR) then
+						k_wall = u_tau**2 / sqrt(C_mu)
+					else
+						k_wall = SMALL_NUM
+					end if
+					if (y_plus > 2.5d0) then
+						omega_wall = u_tau / (sqrt(C_mu) * KAPPA * y)
+					else
+						omega_wall = 6.0d0 * nu_wall / (BETA * y**2)
+					end if
+					ss%k(oc) = max(k_wall, SMALL_NUM); ss%omega(oc) = min(max(omega_wall, 1.0d-10), 1.0d10)
+				end select
+			end do
+		end do
+		do c = 1, ss%nCells
+			ss%k(c) = max(ss%k(c), SMALL_NUM); ss%omega(c) = max(ss%omega(c), SMALL_NUM)
+			ss%mu_t(c) = min(rho * ss%k(c) / max(ss%omega(c), SMALL_NUM), &
+				SIMPLEC_WALL_MU_T_CAP_FACTOR * max(ss%mu_l(c), SMALL_NUM))
+		end do
+	end subroutine simplec_apply_turbulence_bcs
+
 !-----------------------------------------------------------------------
 ! 湍流更新
 !-----------------------------------------------------------------------
-	subroutine simple_turbulence(mesh, ss, fluid)
+	subroutine simple_turbulence(mesh, ss, fluid, k_inf, omega_inf)
 		implicit none
 		type(Meshh), intent(in) :: mesh
 		type(SIMPLEState), intent(inout) :: ss
 		type(Fluidd), intent(in) :: fluid
+		real(kind=8), intent(in) :: k_inf, omega_inf
 		integer :: c, i, j
-		real(kind=8) :: rho, S_mag, P_k, k_new, omega_new
+		real(kind=8) :: rho, S_mag, P_k, D_k, P_omega, D_omega
+		real(kind=8) :: k_eq, omega_eq
 		real(kind=8), allocatable :: gradU(:,:,:), vel(:,:)
 		real(kind=8) :: gU(3,3), S(3,3)
 		
@@ -5647,12 +5851,18 @@ function triangleCentroid(points)
 			end do; end do
 			S_mag = sqrt(2.0d0 * S_mag)
 			
-			P_k = ss%mu_t(c)*S_mag**2
-			P_k = min(P_k, 10.0d0*BETA_STAR*rho*ss%omega(c)*max(ss%k(c),SMALL_NUM))
-			k_new = max(P_k / max(BETA_STAR*rho*ss%omega(c),SMALL_NUM), SMALL_NUM)
-			ss%k(c) = max(ss%k(c) + SIMPLE_ALPHA_K*(k_new-ss%k(c)), SMALL_NUM)
-			omega_new = max(ALPHA*S_mag**2 / max(BETA*ss%omega(c),SMALL_NUM), SMALL_NUM)
-			ss%omega(c) = max(ss%omega(c) + SIMPLE_ALPHA_OMEGA*(omega_new-ss%omega(c)), SMALL_NUM)
+			P_k = ss%mu_t(c) * S_mag**2
+			D_k = BETA_STAR * rho * max(ss%omega(c),SMALL_NUM) * max(ss%k(c),SMALL_NUM)
+			if (D_k > SMALL_NUM) P_k = min(P_k, SIMPLEC_TURB_SOURCE_LIMIT * D_k)
+			k_eq = max(k_inf, P_k / max(BETA_STAR*rho*max(ss%omega(c),SMALL_NUM), SMALL_NUM))
+			ss%k(c) = max(ss%k(c) + SIMPLE_ALPHA_K*(k_eq-ss%k(c)), SMALL_NUM)
+			P_omega = ALPHA * max(ss%omega(c),SMALL_NUM) * P_k / max(ss%k(c),SMALL_NUM)
+			D_omega = BETA * rho * max(ss%omega(c),SMALL_NUM)**2
+			if (D_omega > SMALL_NUM) P_omega = min(P_omega, SIMPLEC_TURB_SOURCE_LIMIT * D_omega)
+			omega_eq = max(omega_inf, P_omega / max(BETA*rho*max(ss%omega(c),SMALL_NUM), SMALL_NUM))
+			ss%omega(c) = max(ss%omega(c) + SIMPLE_ALPHA_OMEGA*(omega_eq-ss%omega(c)), SMALL_NUM)
+			ss%mu_t(c) = min(rho * ss%k(c) / max(ss%omega(c), SMALL_NUM), &
+				SIMPLEC_WALL_MU_T_CAP_FACTOR * ss%mu_l(c))
 		end do
 		deallocate(gradU)
 	end subroutine simple_turbulence
