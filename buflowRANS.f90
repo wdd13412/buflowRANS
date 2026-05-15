@@ -77,6 +77,8 @@ module BuFlowModule
     integer, parameter :: SIMPLEC_EXPERIMENT_FLUX_REBUILD_ONLY = 2
     integer, parameter :: SIMPLEC_EXPERIMENT_MODE = SIMPLEC_EXPERIMENT_BUFLOW4_BOUNDS
     logical, parameter :: DEBUG_MESH_VERBOSE = .false.
+    logical, parameter :: FLUX_BALANCE_DIAGNOSTICS = .true.
+    integer :: JST_DIAG_CALL_COUNT = 0
     !===========================================================================
     
 	type Celll
@@ -1518,10 +1520,13 @@ end subroutine decodePrimitives3D_RANS
 		real(kind=8), allocatable :: fD(:), farOwnerfD(:), farNeighbourfD(:), eps(:,:)
 		real(kind=8), allocatable :: gradU(:,:,:), gradK(:,:,:), gradOmega(:,:,:)
 		real(kind=8), allocatable :: viscousFlux(:), turbulentDiffFlux(:)
-		integer(kind=8) :: f, ownerCell, neighbourCell, v, i1, i2
+		real(kind=8), allocatable :: centralResidual(:,:), artificialResidual(:,:)
+		integer(kind=8) :: f, ownerCell, neighbourCell, v, i1, i2, c
 		integer(kind=8) :: nCells, nFaces, nBoundaries, nBdryFaces, meshInfo(4), i, j
 		real(kind=8) :: mu_eff, rho_face, mu_L_face, mu_T_face, sigma_k_eff, sigma_omega_eff
 		real(kind=8) :: grad_k_n, grad_omega_n, face_area
+		real(kind=8) :: artFlow, centralNorm, artificialNorm, totalNorm
+		real(kind=8) :: centralKOmega, artificialKOmega
 		
 		meshInfo = unstructuredMeshInfo(mesh)
 		nCells = meshInfo(1)
@@ -1529,12 +1534,27 @@ end subroutine decodePrimitives3D_RANS
 		nBoundaries = meshInfo(3)
 		nBdryFaces = meshInfo(4)
 		nVars = size(sln%cellState, 2)  ! 7 for RANS
+		allocate(centralResidual(nCells, nVars), artificialResidual(nCells, nVars))
+		centralResidual = 0.0d0; artificialResidual = 0.0d0
 		
 		!--- 1. Apply boundary conditions ---
 		call updateBoundaryConditions_RANS(mesh, sln, boundaryConditions, nBoundaries, fluid)
 		
 		!--- 2. Compute central difference fluxes ---
 		call linInterp_3D_RANS(mesh, sln%cellFluxes, sln%faceFluxes)
+		if (FLUX_BALANCE_DIAGNOSTICS) then
+			do f = 1, nFaces
+				ownerCell = mesh%faces(f,1); neighbourCell = mesh%faces(f,2)
+				do v = 1, nVars
+					i1 = (v-1)*3 + 1; i2 = i1 + 2
+					artFlow = dot_product(sln%faceFluxes(f,i1:i2), mesh%fAVecs(f,:))
+					centralResidual(ownerCell,v) = centralResidual(ownerCell,v) - artFlow
+					if (neighbourCell > 0 .and. neighbourCell <= nCells) then
+						centralResidual(neighbourCell,v) = centralResidual(neighbourCell,v) + artFlow
+					end if
+				end do
+			end do
+		end if
 		
 		!--- 3. Compute JST artificial dissipation ---
 		allocate(fDeltas(nFaces, nVars))
@@ -1586,6 +1606,11 @@ end subroutine decodePrimitives3D_RANS
 				i1 = (v-1)*3 + 1
 				i2 = i1 + 2
 				sln%faceFluxes(f,i1:i2) = sln%faceFluxes(f,i1:i2) - (diffusionFlux(v) * unitFA)
+				if (FLUX_BALANCE_DIAGNOSTICS) then
+					artFlow = dot_product(-diffusionFlux(v) * unitFA, mesh%fAVecs(f,:))
+					artificialResidual(ownerCell,v) = artificialResidual(ownerCell,v) - artFlow
+					artificialResidual(neighbourCell,v) = artificialResidual(neighbourCell,v) + artFlow
+				end if
 			end do
 			
 			!--- RANS k-omega: Add viscous fluxes ---
@@ -1633,11 +1658,30 @@ end subroutine decodePrimitives3D_RANS
 		!--- 7. Integrate fluxes to get cell residuals ---
 		allocate(unstructured_JSTFluxx(nCells, nVars))
 		unstructured_JSTFluxx = integrateFluxes_unstructured3D_RANS(mesh, sln)
+		if (FLUX_BALANCE_DIAGNOSTICS) then
+			do c = 1, nCells
+				centralResidual(c,:) = centralResidual(c,:) / mesh%cVols(c)
+				artificialResidual(c,:) = artificialResidual(c,:) / mesh%cVols(c)
+			end do
+			JST_DIAG_CALL_COUNT = JST_DIAG_CALL_COUNT + 1
+			centralNorm = sqrt(sum(centralResidual*centralResidual) / dble(nCells*nVars))
+			artificialNorm = sqrt(sum(artificialResidual*artificialResidual) / dble(nCells*nVars))
+			totalNorm = sqrt(sum(unstructured_JSTFluxx*unstructured_JSTFluxx) / dble(nCells*nVars))
+			centralKOmega = sqrt(sum(centralResidual(:,6:7)**2) / dble(2*nCells))
+			artificialKOmega = sqrt(sum(artificialResidual(:,6:7)**2) / dble(2*nCells))
+			if (JST_DIAG_CALL_COUNT <= 5 .or. mod(JST_DIAG_CALL_COUNT, 50) == 0) then
+				write(*,'(A,I6,A,ES11.3,A,ES11.3,A,ES11.3,A,ES11.3,A,ES11.3)') &
+					'  jstFlux', JST_DIAG_CALL_COUNT, ' centralRes=', centralNorm, &
+					' artificialRes=', artificialNorm, ' totalRes=', totalNorm, &
+					' artificial/central=', artificialNorm/max(centralNorm,1.0d-30), &
+					' kOmegaArtificial/central=', artificialKOmega/max(centralKOmega,1.0d-30)
+			end if
+		end if
 		
 		!--- Cleanup ---
 		deallocate(fDeltas, fDGrads, eps2, eps4, diffusionFlux, unitFA, fD)
 		deallocate(farOwnerfD, farNeighbourfD, viscousFlux, turbulentDiffFlux)
-		deallocate(gradU, gradK, gradOmega)
+		deallocate(gradU, gradK, gradOmega, centralResidual, artificialResidual)
 	end function unstructured_JSTFlux_RANS
 
 !===============================================================================
@@ -4602,7 +4646,7 @@ function triangleCentroid(points)
 			call simplec_momentum(mesh, ss, boundaryConditions, fluid, U_init)
 			
 			! 步骤2：压力修正 + 可控后处理实验
-			call simplec_pressure(mesh, ss, boundaryConditions, U_init)
+			call simplec_pressure(mesh, ss, boundaryConditions, U_init, iter)
 			select case (SIMPLEC_EXPERIMENT_MODE)
 			case (SIMPLEC_EXPERIMENT_BUFLOW4_BOUNDS)
 				! buflowRANS4 对照实验：全场 p/U bounded 后处理，并重建面通量。
@@ -4622,7 +4666,7 @@ function triangleCentroid(points)
 			! 步骤4：k-omega 湍流更新。外场维持自由流湍流，车身壁面施加
 			! 与密度基求解器一致的 fixed turbulent wall-function 约束。
 			if (mod(iter, SIMPLEC_TURB_UPDATE_INTERVAL) == 0) then
-				call simple_turbulence(mesh, ss, fluid, k_init, omega_init)
+				call simple_turbulence(mesh, ss, boundaryConditions, fluid, U_init, k_init, omega_init)
 			end if
 			call simplec_apply_turbulence_bcs(mesh, ss, boundaryConditions, fluid, U_init, k_init, omega_init)
 			
@@ -4852,15 +4896,17 @@ function triangleCentroid(points)
 !-----------------------------------------------------------------------
 ! SIMPLEC 压力修正：PCG求解压力方程并保持Rhie-Chow面通量一致
 !-----------------------------------------------------------------------
-	subroutine simplec_pressure(mesh, ss, bcs, U_in)
+	subroutine simplec_pressure(mesh, ss, bcs, U_in, iter)
 		implicit none
 		type(Meshh), intent(in) :: mesh
 		type(SIMPLEState), intent(inout) :: ss
 		type(BoundaryCondition), intent(in) :: bcs(:)
 		real(kind=8), intent(in) :: U_in(3)
+		integer, intent(in) :: iter
 		
 		integer :: c, f, b, fi, face_idx, oc, nc, nInt
 		real(kind=8) :: rho, fn(3), fn_m, d_m, d2, D_f, D_base, flux_s, fv(3), D_c
+		real(kind=8) :: central_flux, rc_flux, central_norm, rc_norm, total_norm
 		real(kind=8) :: dvec(3), nonorth(3), orth_coeff, grad_face_dot_area
 		real(kind=8) :: alpha_p_eff, p_step_limit, p_prime_max
 		integer, parameter :: MNB = 30
@@ -4868,6 +4914,7 @@ function triangleCentroid(points)
 		real(kind=8) :: aN_pp(ss%nCells, MNB)
 		integer :: nb_i(ss%nCells, MNB), nb_n(ss%nCells)
 		real(kind=8), allocatable :: gP(:,:), gPp(:,:), pm(:,:), tg(:,:,:)
+		real(kind=8), allocatable :: centralSrc(:), rcSrc(:)
 		
 		nInt = ss%nFaces - ss%nBdryFaces
 		rho = ss%rho_ref
@@ -4892,6 +4939,8 @@ function triangleCentroid(points)
 		aP_pp = 0.0d0; src = 0.0d0
 		aN_pp = 0.0d0; nb_i = 0; nb_n = 0
 		ss%p_prime = 0.0d0
+		allocate(centralSrc(ss%nCells), rcSrc(ss%nCells))
+		centralSrc = 0.0d0; rcSrc = 0.0d0
 		
 		! 内部面
 		do f = 1, nInt
@@ -4912,18 +4961,24 @@ function triangleCentroid(points)
 			grad_face_dot_area = orth_coeff * (ss%p(nc)-ss%p(oc)) &
 				+ SIMPLEC_NONORTH_CORRECTION * dot_product(0.5d0*(gP(oc,:)+gP(nc,:)), nonorth)
 			
-			! Rhie-Chow 预测面通量：正交部分隐式、非正交部分显式修正
+			! Rhie-Chow 预测面通量：中心速度通量 + 压力滤波/人工耗散通量
 			fv(1) = 0.5d0*(ss%u(oc)+ss%u(nc))
 			fv(2) = 0.5d0*(ss%v(oc)+ss%v(nc))
 			fv(3) = 0.5d0*(ss%w(oc)+ss%w(nc))
-			flux_s = rho * dot_product(fv, fn) - rho * D_base * grad_face_dot_area
+			central_flux = rho * dot_product(fv, fn)
+			rc_flux = -rho * D_base * grad_face_dot_area
+			flux_s = central_flux + rc_flux
 			
 			! 存储预测面通量
 			ss%phi_f(f) = flux_s
 			
-			! 连续性源项
+			! 连续性源项，并分别累计中心通量/RC人工耗散的残差量级
 			src(oc) = src(oc) - flux_s
 			src(nc) = src(nc) + flux_s
+			centralSrc(oc) = centralSrc(oc) - central_flux
+			centralSrc(nc) = centralSrc(nc) + central_flux
+			rcSrc(oc) = rcSrc(oc) - rc_flux
+			rcSrc(nc) = rcSrc(nc) + rc_flux
 			
 			! 压力方程系数：只把正交部分放入矩阵，非正交项已在通量中显式修正
 			D_f = rho * D_base * orth_coeff
@@ -4955,11 +5010,13 @@ function triangleCentroid(points)
 				case(InletBoundary)
 					ss%phi_f(face_idx) = rho * dot_product(U_in, fn)
 					src(oc) = src(oc) - ss%phi_f(face_idx)
+					centralSrc(oc) = centralSrc(oc) - ss%phi_f(face_idx)
 				case(OutletBoundary)
 					fv = (/ss%u(oc), ss%v(oc), ss%w(oc)/)
 					flux_s = rho * dot_product(fv, fn)
 					ss%phi_f(face_idx) = flux_s
 					src(oc) = src(oc) - flux_s
+					centralSrc(oc) = centralSrc(oc) - flux_s
 					! 出口 p'=0 贡献
 					d_m = max(mag(mesh%fCenters(face_idx,:)-mesh%cCenters(oc,:)), 1.0d-10)
 					D_f = SIMPLEC_RC_DAMPING * mesh%cVols(oc) / ss%aP_u(oc)
@@ -4975,6 +5032,15 @@ function triangleCentroid(points)
 		do c = 1, ss%nCells
 			if (aP_pp(c) < 1.0d-30) aP_pp(c) = 1.0d0
 		end do
+		if (FLUX_BALANCE_DIAGNOSTICS .and. (iter <= 5 .or. mod(iter, 50) == 0)) then
+			central_norm = sqrt(sum(centralSrc*centralSrc) / dble(ss%nCells))
+			rc_norm = sqrt(sum(rcSrc*rcSrc) / dble(ss%nCells))
+			total_norm = sqrt(sum(src*src) / dble(ss%nCells))
+			write(*,'(A,I6,A,ES11.3,A,ES11.3,A,ES11.3,A,ES11.3)') &
+				'  simpleFlux', iter, ' centralMassRes=', central_norm, &
+				' rcArtificialRes=', rc_norm, ' totalContRes=', total_norm, &
+				' rc/central=', rc_norm / max(central_norm, 1.0d-30)
+		end if
 		
 		! PCG 求解 p'。压力矩阵是 aP*p' - sum(aN*p'_nb) = src，
 		! 对角预处理共轭梯度比逐点GS更快消除全局压力误差。
@@ -5050,7 +5116,7 @@ function triangleCentroid(points)
 			end do
 		end do
 		
-		deallocate(gP, gPp)
+		deallocate(gP, gPp, centralSrc, rcSrc)
 	end subroutine simplec_pressure
 
 
@@ -5823,25 +5889,102 @@ function triangleCentroid(points)
 !-----------------------------------------------------------------------
 ! 湍流更新
 !-----------------------------------------------------------------------
-	subroutine simple_turbulence(mesh, ss, fluid, k_inf, omega_inf)
+	subroutine simple_turbulence(mesh, ss, bcs, fluid, U_in, k_inf, omega_inf)
 		implicit none
 		type(Meshh), intent(in) :: mesh
 		type(SIMPLEState), intent(inout) :: ss
+		type(BoundaryCondition), intent(in) :: bcs(:)
 		type(Fluidd), intent(in) :: fluid
-		real(kind=8), intent(in) :: k_inf, omega_inf
-		integer :: c, i, j
-		real(kind=8) :: rho, S_mag, P_k, D_k, P_omega, D_omega
-		real(kind=8) :: k_eq, omega_eq
+		real(kind=8), intent(in) :: U_in(3), k_inf, omega_inf
+		integer :: c, f, b, fi, face_idx, oc, nc, i, j, nInt
+		real(kind=8) :: rho, S_mag, P_k, D_k_src, P_omega, D_omega_src
+		real(kind=8) :: phi, area, d_m, gamma_k, gamma_o, coeffK, coeffO
+		real(kind=8) :: fn(3), vol, sinkK, sinkO, mu_l_face, mu_t_face
+		real(kind=8) :: aK(ss%nCells), aO(ss%nCells), bK(ss%nCells), bO(ss%nCells)
 		real(kind=8), allocatable :: gradU(:,:,:), vel(:,:)
 		real(kind=8) :: gU(3,3), S(3,3)
-		
+
 		rho = ss%rho_ref
+		nInt = ss%nFaces - ss%nBdryFaces
+		aK = 1.0d-30; aO = 1.0d-30
+		bK = 0.0d0; bO = 0.0d0
+
 		allocate(vel(ss%nCells, 3))
 		vel(:,1)=ss%u; vel(:,2)=ss%v; vel(:,3)=ss%w
 		allocate(gradU(ss%nCells, 3, 3))
 		gradU = greenGaussGrad_RANS(mesh, vel, .false.)
 		deallocate(vel)
-		
+
+		! Internal finite-volume convection/diffusion, aligned with the density JST
+		! k-omega equations: convective transport plus physical/turbulent diffusion.
+		do f = 1, nInt
+			oc = mesh%faces(f,1); nc = mesh%faces(f,2)
+			if (oc<1 .or. oc>ss%nCells .or. nc<1 .or. nc>ss%nCells) cycle
+			fn = mesh%fAVecs(f,:); area = mag(fn)
+			if (area < 1.0d-30) cycle
+			d_m = max(mag(mesh%cCenters(nc,:)-mesh%cCenters(oc,:)), 1.0d-10)
+			phi = ss%phi_f(f)
+			mu_l_face = 0.5d0*(ss%mu_l(oc)+ss%mu_l(nc))
+			mu_t_face = 0.5d0*(ss%mu_t(oc)+ss%mu_t(nc))
+			gamma_k = (mu_l_face + mu_t_face / SIGMA_K) * area / d_m
+			gamma_o = (mu_l_face + mu_t_face / SIGMA_OMEGA) * area / d_m
+
+			coeffK = gamma_k + max(-phi, 0.0d0)
+			coeffO = gamma_o + max(-phi, 0.0d0)
+			aK(oc) = aK(oc) + gamma_k + max(phi, 0.0d0)
+			aO(oc) = aO(oc) + gamma_o + max(phi, 0.0d0)
+			bK(oc) = bK(oc) + coeffK * ss%k(nc)
+			bO(oc) = bO(oc) + coeffO * ss%omega(nc)
+
+			coeffK = gamma_k + max(phi, 0.0d0)
+			coeffO = gamma_o + max(phi, 0.0d0)
+			aK(nc) = aK(nc) + gamma_k + max(-phi, 0.0d0)
+			aO(nc) = aO(nc) + gamma_o + max(-phi, 0.0d0)
+			bK(nc) = bK(nc) + coeffK * ss%k(oc)
+			bO(nc) = bO(nc) + coeffO * ss%omega(oc)
+		end do
+
+		! Boundary scalar transport: fixed freestream at inlet/backflow, zero-gradient
+		! outlet outflow, and no scalar flux at wall/empty before wall functions apply.
+		do b = 1, min(ss%nBoundaries, size(bcs))
+			do fi = 1, size(mesh%boundaryFaces, 2)
+				face_idx = mesh%boundaryFaces(b, fi)
+				if (face_idx == 0) exit
+				if (face_idx<1 .or. face_idx>ss%nFaces) cycle
+				oc = mesh%faces(face_idx, 1)
+				if (oc<1 .or. oc>ss%nCells) cycle
+				area = mag(mesh%fAVecs(face_idx,:))
+				d_m = max(mag(mesh%fCenters(face_idx,:)-mesh%cCenters(oc,:)), 1.0d-10)
+				gamma_k = (ss%mu_l(oc) + ss%mu_t(oc) / SIGMA_K) * area / d_m
+				gamma_o = (ss%mu_l(oc) + ss%mu_t(oc) / SIGMA_OMEGA) * area / d_m
+				phi = ss%phi_f(face_idx)
+				select case (bcs(b)%type)
+				case (InletBoundary)
+					coeffK = gamma_k + max(-phi, 0.0d0)
+					coeffO = gamma_o + max(-phi, 0.0d0)
+					aK(oc) = aK(oc) + coeffK; aO(oc) = aO(oc) + coeffO
+					bK(oc) = bK(oc) + coeffK * k_inf
+					bO(oc) = bO(oc) + coeffO * omega_inf
+				case (OutletBoundary)
+					if (phi < 0.0d0) then
+						coeffK = gamma_k + max(-phi, 0.0d0)
+						coeffO = gamma_o + max(-phi, 0.0d0)
+						aK(oc) = aK(oc) + coeffK; aO(oc) = aO(oc) + coeffO
+						bK(oc) = bK(oc) + coeffK * k_inf
+						bO(oc) = bO(oc) + coeffO * omega_inf
+					else
+						aK(oc) = aK(oc) + max(phi, 0.0d0)
+						aO(oc) = aO(oc) + max(phi, 0.0d0)
+					end if
+				case default
+					continue
+				end select
+			end do
+		end do
+
+		! Source terms use the same production/destruction balance and limiter as
+		! computeTurbulenceSourceTerms in the density-based solver, but are
+		! linearised into a bounded steady scalar update for SIMPLEC.
 		do c = 1, ss%nCells
 			gU = gradU(c,:,:)
 			S_mag = 0.0d0
@@ -5850,19 +5993,37 @@ function triangleCentroid(points)
 				S_mag = S_mag + S(i,j)**2
 			end do; end do
 			S_mag = sqrt(2.0d0 * S_mag)
-			
+			vol = mesh%cVols(c)
 			P_k = ss%mu_t(c) * S_mag**2
-			D_k = BETA_STAR * rho * max(ss%omega(c),SMALL_NUM) * max(ss%k(c),SMALL_NUM)
-			if (D_k > SMALL_NUM) P_k = min(P_k, SIMPLEC_TURB_SOURCE_LIMIT * D_k)
-			k_eq = max(k_inf, P_k / max(BETA_STAR*rho*max(ss%omega(c),SMALL_NUM), SMALL_NUM))
-			ss%k(c) = max(ss%k(c) + SIMPLE_ALPHA_K*(k_eq-ss%k(c)), SMALL_NUM)
-			P_omega = ALPHA * max(ss%omega(c),SMALL_NUM) * P_k / max(ss%k(c),SMALL_NUM)
-			D_omega = BETA * rho * max(ss%omega(c),SMALL_NUM)**2
-			if (D_omega > SMALL_NUM) P_omega = min(P_omega, SIMPLEC_TURB_SOURCE_LIMIT * D_omega)
-			omega_eq = max(omega_inf, P_omega / max(BETA*rho*max(ss%omega(c),SMALL_NUM), SMALL_NUM))
-			ss%omega(c) = max(ss%omega(c) + SIMPLE_ALPHA_OMEGA*(omega_eq-ss%omega(c)), SMALL_NUM)
+			D_k_src = BETA_STAR * rho * max(ss%omega(c),SMALL_NUM) * max(ss%k(c),SMALL_NUM)
+			if (D_k_src > SMALL_NUM) P_k = min(P_k, SIMPLEC_TURB_SOURCE_LIMIT * D_k_src)
+			if (ss%k(c) > SMALL_NUM) then
+				P_omega = ALPHA * (ss%omega(c) / ss%k(c)) * P_k
+			else
+				P_omega = 0.0d0
+			end if
+			D_omega_src = BETA * rho * max(ss%omega(c),SMALL_NUM)**2
+			if (D_omega_src > SMALL_NUM) P_omega = min(P_omega, SIMPLEC_TURB_SOURCE_LIMIT * D_omega_src)
+
+			sinkK = BETA_STAR * rho * max(ss%omega(c),SMALL_NUM) * vol
+			sinkO = BETA * rho * max(ss%omega(c),SMALL_NUM) * vol
+			aK(c) = aK(c) + sinkK
+			aO(c) = aO(c) + sinkO
+			bK(c) = bK(c) + P_k * vol
+			bO(c) = bO(c) + P_omega * vol
+
+			! Under-relaxation mirrors the momentum equation treatment.
+			bK(c) = bK(c) + (1.0d0-SIMPLE_ALPHA_K) * (aK(c)/SIMPLE_ALPHA_K) * ss%k(c)
+			bO(c) = bO(c) + (1.0d0-SIMPLE_ALPHA_OMEGA) * (aO(c)/SIMPLE_ALPHA_OMEGA) * ss%omega(c)
+			aK(c) = aK(c) / SIMPLE_ALPHA_K
+			aO(c) = aO(c) / SIMPLE_ALPHA_OMEGA
+		end do
+
+		do c = 1, ss%nCells
+			ss%k(c) = max(bK(c) / max(aK(c), 1.0d-30), SMALL_NUM)
+			ss%omega(c) = max(bO(c) / max(aO(c), 1.0d-30), SMALL_NUM)
 			ss%mu_t(c) = min(rho * ss%k(c) / max(ss%omega(c), SMALL_NUM), &
-				SIMPLEC_WALL_MU_T_CAP_FACTOR * ss%mu_l(c))
+				SIMPLEC_WALL_MU_T_CAP_FACTOR * max(ss%mu_l(c), SMALL_NUM))
 		end do
 		deallocate(gradU)
 	end subroutine simple_turbulence
